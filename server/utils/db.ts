@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS sources (
   platforms TEXT NOT NULL DEFAULT '[]',
   last_checked_at TEXT,
   last_error TEXT,
+  update_info_json TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -50,6 +51,10 @@ CREATE TABLE IF NOT EXISTS download_tasks (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_download_tasks_playlist_url ON download_tasks(playlist_url);
+CREATE INDEX IF NOT EXISTS idx_download_tasks_batch_id ON download_tasks(batch_id);
 `
 
 export function openDb(dataDir?: string) {
@@ -57,17 +62,34 @@ export function openDb(dataDir?: string) {
   mkdirSync(dirname(path), { recursive: true })
   const db = new Database(path)
   db.pragma('journal_mode = WAL')
+  db.pragma('synchronous = NORMAL')
+  db.pragma('temp_store = MEMORY')
+  db.pragma('cache_size = -2000')
+  db.pragma('wal_autocheckpoint = 100')
+  db.pragma('mmap_size = 0')
   db.exec(SCHEMA)
   migrateSchema(db)
   return db
 }
 
 function migrateSchema(db: Database.Database) {
-  const cols = db.prepare(`PRAGMA table_info(download_tasks)`).all() as Array<{ name: string }>
-  const names = new Set(cols.map((c) => c.name))
-  if (!names.has('file_size')) {
+  const taskCols = db.prepare(`PRAGMA table_info(download_tasks)`).all() as Array<{ name: string }>
+  const taskNames = new Set(taskCols.map((c) => c.name))
+  if (!taskNames.has('file_size')) {
     db.exec(`ALTER TABLE download_tasks ADD COLUMN file_size INTEGER`)
   }
+
+  const sourceCols = db.prepare(`PRAGMA table_info(sources)`).all() as Array<{ name: string }>
+  const sourceNames = new Set(sourceCols.map((c) => c.name))
+  if (!sourceNames.has('update_info_json')) {
+    db.exec(`ALTER TABLE sources ADD COLUMN update_info_json TEXT`)
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
+    CREATE INDEX IF NOT EXISTS idx_download_tasks_playlist_url ON download_tasks(playlist_url);
+    CREATE INDEX IF NOT EXISTS idx_download_tasks_batch_id ON download_tasks(batch_id);
+  `)
 }
 
 export function getDb() {
@@ -81,5 +103,16 @@ export function closeDb() {
   if (dbInstance) {
     dbInstance.close()
     dbInstance = null
+  }
+}
+
+export function checkpointAndShrinkDb() {
+  if (dbInstance) {
+    try {
+      dbInstance.pragma('wal_checkpoint(TRUNCATE)')
+      dbInstance.pragma('shrink_memory')
+    } catch {
+      /* ignore */
+    }
   }
 }

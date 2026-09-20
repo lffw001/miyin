@@ -20,6 +20,8 @@ export const SOURCE_PROGRESS_PHASE_LABEL: Record<SourceProgressPhase, string> = 
   failed: '失败',
 }
 
+export type SourceLogLevel = 'log' | 'info' | 'warn' | 'error'
+
 export type SourceProgressEvent = {
   type: 'progress'
   index: number
@@ -27,6 +29,14 @@ export type SourceProgressEvent = {
   name: string
   status: SourceProgressPhase
   error?: string
+}
+
+export type SourceLogEvent = {
+  type: 'log'
+  level: SourceLogLevel
+  message: string
+  name?: string
+  index?: number
 }
 
 export type SourceBatchDoneEvent = {
@@ -39,6 +49,8 @@ export type SourceBatchDoneEvent = {
   failed?: number
   deleted?: number
   timedOut?: boolean
+  /** 用户主动停止；已完成项保留，未处理项不再继续 */
+  cancelled?: boolean
   items?: Array<{ id: string; status: string; error?: string }>
   results?: Array<Record<string, unknown>>
 }
@@ -48,10 +60,19 @@ export type SourceBatchErrorEvent = {
   message: string
 }
 
+export type SourceBatchCancelledEvent = {
+  type: 'cancelled'
+  message?: string
+  total?: number
+  processed?: number
+}
+
 export type SourceBatchStreamEvent =
   | SourceProgressEvent
+  | SourceLogEvent
   | SourceBatchDoneEvent
   | SourceBatchErrorEvent
+  | SourceBatchCancelledEvent
   | { type: 'start'; total: number }
 
 export type SourceProgressReporter = (event: {
@@ -61,6 +82,19 @@ export type SourceProgressReporter = (event: {
   status: SourceProgressPhase
   error?: string
 }) => void | Promise<void>
+
+export type SourceLogReporter = (event: {
+  level: SourceLogLevel
+  message: string
+  name?: string
+  index?: number
+}) => void | Promise<void>
+
+export type SourceBatchHandlers = {
+  onProgress?: SourceProgressReporter
+  onLog?: SourceLogReporter
+  signal?: AbortSignal
+}
 
 export function sourceBatchTimeoutMs(total: number, itemMs = SOURCE_ITEM_TIMEOUT_MS): number {
   const n = Math.max(0, Math.floor(total))

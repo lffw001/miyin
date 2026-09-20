@@ -3,17 +3,18 @@ import { writeFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs'
 import { getDb } from '../utils/db'
 import { getSourceCachePath } from '../utils/paths'
 import { allocateUniqueName, cleanSourceName, parseSourceText } from './sourceImport'
+import { probeLocalScript } from './sourceProbe'
+import type { SourceBatchHandlers, SourceProgressReporter } from '#shared/sourceBatchProgress'
 import {
-  acquireSourceRejectionGuard,
-  loadLxSource,
-  settleSourceNetworkErrors,
-} from './sourceRuntime'
-import type { SourceProgressReporter } from '#shared/sourceBatchProgress'
+  isDirectSourceScriptUrl,
+  type SourceUpdateInfo,
+} from '#shared/sourceUpdate'
 import {
   SOURCE_ITEM_TIMEOUT_MS,
   createBatchDeadline,
   reportProgress,
   withTimeout,
+  assertBatchNotAborted,
 } from '../utils/sourceBatchTimeout'
 
 export type SourceRow = {
@@ -27,12 +28,31 @@ export type SourceRow = {
   platforms: string
   last_checked_at: string | null
   last_error: string | null
+  update_info_json: string | null
   created_at: string
   updated_at: string
 }
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function encodeUpdateInfo(info: SourceUpdateInfo | null | undefined): string | null {
+  if (!info) return null
+  if (!info.version && !info.updateUrl && !info.description && !info.message) return null
+  return JSON.stringify(info)
+}
+
+export function parseSourceUpdateInfoJson(raw: string | null | undefined): SourceUpdateInfo | null {
+  if (!raw) return null
+  try {
+    const obj = JSON.parse(raw) as SourceUpdateInfo
+    if (!obj || typeof obj !== 'object') return null
+    if (!obj.version && !obj.updateUrl && !obj.description && !obj.message) return null
+    return obj
+  } catch {
+    return null
+  }
 }
 
 function idFromUrl(url: string) {
@@ -45,34 +65,6 @@ function newLocalId() {
 
 function isHttpUrl(url: string) {
   return /^https?:\/\//i.test(url.trim())
-}
-
-async function probeLocalScript(localPath: string): Promise<{
-  platforms: string[]
-  status: string
-  lastError: string | null
-}> {
-  let platforms: string[] = []
-  let status = 'unknown'
-  let lastError: string | null = null
-  const guard = acquireSourceRejectionGuard()
-  try {
-    const handle = await loadLxSource(localPath, { bypassCache: true })
-    platforms = handle.platforms
-    const netErrs = await settleSourceNetworkErrors(guard)
-    if (netErrs.length) {
-      status = 'dead'
-      lastError = `更新检测失败: ${netErrs[0]!.message}`
-    } else {
-      status = 'ok'
-    }
-  } catch (err: any) {
-    status = 'dead'
-    lastError = err?.message || String(err)
-  } finally {
-    guard.release()
-  }
-  return { platforms, status, lastError }
 }
 
 export function listSources(): SourceRow[] {
@@ -119,6 +111,8 @@ async function persistSource(input: {
   mirrorUrl?: string
   allowUpdate: boolean
   onPhase?: (status: 'loading' | 'configuring' | 'checking') => void | Promise<void>
+  onLog?: SourceBatchHandlers['onLog']
+  logIndex?: number
 }): Promise<SourceRow> {
   const id = idFromUrl(input.url)
   const existing = getSource(id)
@@ -133,16 +127,21 @@ async function persistSource(input: {
   writeFileSync(localPath, script, 'utf8')
 
   await input.onPhase?.('checking')
-  const probed = await probeLocalScript(localPath)
+  const probed = await probeLocalScript(localPath, {
+    onLog: input.onLog,
+    name: input.name,
+    index: input.logIndex,
+  })
   const platforms = probed.platforms
   const status = probed.status
   const lastError = probed.lastError
+  const updateInfo = encodeUpdateInfo(probed.updateInfo)
 
   const ts = nowIso()
   if (existing) {
     getDb()
       .prepare(
-        `UPDATE sources SET name=?, url=?, mirror_url=?, local_path=?, status=?, platforms=?, last_checked_at=?, last_error=?, updated_at=? WHERE id=?`,
+        `UPDATE sources SET name=?, url=?, mirror_url=?, local_path=?, status=?, platforms=?, last_checked_at=?, last_error=?, update_info_json=?, updated_at=? WHERE id=?`,
       )
       .run(
         input.name,
@@ -153,14 +152,15 @@ async function persistSource(input: {
         JSON.stringify(platforms),
         ts,
         lastError,
+        updateInfo,
         ts,
         id,
       )
   } else {
     getDb()
       .prepare(
-        `INSERT INTO sources (id, name, url, mirror_url, local_path, enabled, status, platforms, last_checked_at, last_error, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO sources (id, name, url, mirror_url, local_path, enabled, status, platforms, last_checked_at, last_error, update_info_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -172,6 +172,7 @@ async function persistSource(input: {
         JSON.stringify(platforms),
         ts,
         lastError,
+        updateInfo,
         ts,
         ts,
       )
@@ -204,12 +205,20 @@ export async function addSource(input: { name: string; url: string; mirrorUrl?: 
 }
 
 /** 按 URL 写入或更新（检测/重新拉取脚本用） */
-export async function upsertSourceFromRemote(input: { name: string; url: string; mirrorUrl?: string }) {
+export async function upsertSourceFromRemote(input: {
+  name: string
+  url: string
+  mirrorUrl?: string
+  onLog?: SourceBatchHandlers['onLog']
+  logIndex?: number
+}) {
   return await persistSource({
     name: input.name,
     url: input.url,
     mirrorUrl: input.mirrorUrl,
     allowUpdate: true,
+    onLog: input.onLog,
+    logIndex: input.logIndex,
   })
 }
 
@@ -220,7 +229,7 @@ export async function upsertSourceFromRemote(input: { name: string; url: string;
  */
 export async function importSourcesText(
   text: string,
-  opts?: { onProgress?: SourceProgressReporter },
+  opts?: SourceBatchHandlers,
 ) {
   const parsed = parseSourceText(text)
   if (!parsed.length) {
@@ -236,10 +245,22 @@ export async function importSourcesText(
   let renamed = 0
   let failed = 0
   let timedOut = false
+  let cancelled = false
 
   for (let i = 0; i < parsed.length; i++) {
     const index = i + 1
     const item = parsed[i]!
+
+    if (opts?.signal?.aborted) {
+      cancelled = true
+      break
+    }
+    try {
+      assertBatchNotAborted(opts?.signal)
+    } catch {
+      cancelled = true
+      break
+    }
 
     if (deadline.isExpired()) {
       timedOut = true
@@ -293,6 +314,8 @@ export async function importSourcesText(
             name: finalName,
             url: item.url,
             allowUpdate: false,
+            onLog: opts?.onLog,
+            logIndex: index,
             onPhase: async (status) => {
               await reportProgress(opts?.onProgress, {
                 index,
@@ -318,8 +341,13 @@ export async function importSourcesText(
         })(),
         SOURCE_ITEM_TIMEOUT_MS,
         `音源「${finalName}」`,
+        opts?.signal,
       )
     } catch (err: any) {
+      if (err?.name === 'AbortError' || opts?.signal?.aborted) {
+        cancelled = true
+        break
+      }
       failed += 1
       const message = err?.message || String(err)
       await reportProgress(opts?.onProgress, {
@@ -340,6 +368,7 @@ export async function importSourcesText(
     renamed,
     failed,
     timedOut,
+    cancelled,
     results,
   }
 }
@@ -359,6 +388,39 @@ export function updateSource(id: string, patch: { enabled?: boolean; name?: stri
     .prepare('UPDATE sources SET enabled=?, name=?, updated_at=? WHERE id=?')
     .run(enabled, name, nowIso(), id)
   return getSource(id)!
+}
+
+/** 仍启用的异常（status=dead）音源 */
+export function listEnabledDeadSources(): SourceRow[] {
+  return getDb()
+    .prepare(`SELECT * FROM sources WHERE status = 'dead' AND enabled = 1 ORDER BY created_at DESC`)
+    .all() as SourceRow[]
+}
+
+/**
+ * 一键停用所有异常音源（status=dead 且仍启用）。
+ * 不删除脚本与记录，仅把 enabled 置 0。
+ */
+export function disableDeadSources(): {
+  disabled: number
+  ids: string[]
+  names: string[]
+} {
+  const rows = listEnabledDeadSources()
+  if (!rows.length) return { disabled: 0, ids: [], names: [] }
+  const ts = nowIso()
+  const stmt = getDb().prepare('UPDATE sources SET enabled = 0, updated_at = ? WHERE id = ?')
+  const ids: string[] = []
+  const names: string[] = []
+  const tx = getDb().transaction((list: SourceRow[]) => {
+    for (const row of list) {
+      stmt.run(ts, row.id)
+      ids.push(row.id)
+      names.push(row.name)
+    }
+  })
+  tx(rows)
+  return { disabled: ids.length, ids, names }
 }
 
 export function readSourceScript(id: string): string {
@@ -383,6 +445,8 @@ export async function addSourceFromScript(input: {
   /** 单个新增：名称冲突时自动改成「名称 (2)」…；默认报错 */
   renameOnConflict?: boolean
   onPhase?: (status: 'loading' | 'configuring' | 'checking') => void | Promise<void>
+  onLog?: SourceBatchHandlers['onLog']
+  logIndex?: number
 }) {
   let name = cleanSourceName(input.name)
   const script = String(input.script || '')
@@ -426,14 +490,18 @@ export async function addSourceFromScript(input: {
   const localPath = getSourceCachePath(id)
   writeFileSync(localPath, script, 'utf8')
   await input.onPhase?.('checking')
-  const probed = await probeLocalScript(localPath)
+  const probed = await probeLocalScript(localPath, {
+    onLog: input.onLog,
+    name,
+    index: input.logIndex,
+  })
   const ts = nowIso()
   const enabled = input.enabled === false ? 0 : 1
 
   getDb()
     .prepare(
-      `INSERT INTO sources (id, name, url, mirror_url, local_path, enabled, status, platforms, last_checked_at, last_error, created_at, updated_at)
-       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO sources (id, name, url, mirror_url, local_path, enabled, status, platforms, last_checked_at, last_error, update_info_json, created_at, updated_at)
+       VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -445,6 +513,7 @@ export async function addSourceFromScript(input: {
       JSON.stringify(probed.platforms),
       ts,
       probed.lastError,
+      encodeUpdateInfo(probed.updateInfo),
       ts,
       ts,
     )
@@ -458,6 +527,7 @@ export async function saveSourceScript(
     script: string
     name?: string
     onPhase?: (status: 'loading' | 'configuring' | 'checking') => void | Promise<void>
+    onLog?: SourceBatchHandlers['onLog']
   },
 ): Promise<SourceRow> {
   const row = getSource(id)
@@ -484,11 +554,14 @@ export async function saveSourceScript(
   const localPath = row.local_path || getSourceCachePath(id)
   writeFileSync(localPath, script, 'utf8')
   await input.onPhase?.('checking')
-  const probed = await probeLocalScript(localPath)
+  const probed = await probeLocalScript(localPath, {
+    onLog: input.onLog,
+    name,
+  })
   const ts = nowIso()
   getDb()
     .prepare(
-      `UPDATE sources SET name=?, local_path=?, status=?, platforms=?, last_checked_at=?, last_error=?, updated_at=? WHERE id=?`,
+      `UPDATE sources SET name=?, local_path=?, status=?, platforms=?, last_checked_at=?, last_error=?, update_info_json=?, updated_at=? WHERE id=?`,
     )
     .run(
       name,
@@ -497,6 +570,7 @@ export async function saveSourceScript(
       JSON.stringify(probed.platforms),
       ts,
       probed.lastError,
+      encodeUpdateInfo(probed.updateInfo),
       ts,
       id,
     )
@@ -518,6 +592,29 @@ export async function refreshSourceScriptFromUrl(id: string): Promise<SourceRow>
     url: row.url,
     mirrorUrl: row.mirror_url || undefined,
   })
+}
+
+/**
+ * 按检测得到的 updateUrl 一键更新脚本（仅直链 .js）。
+ * 不改动音源登记 URL，只覆盖本地脚本内容。
+ */
+export async function applySourceUpdateFromInfo(id: string): Promise<SourceRow> {
+  const row = getSource(id)
+  if (!row) throw createError({ statusCode: 404, statusMessage: '音源不存在' })
+  const info = parseSourceUpdateInfoJson(row.update_info_json)
+  const updateUrl = info?.updateUrl?.trim()
+  if (!updateUrl) {
+    throw createError({ statusCode: 400, statusMessage: '该音源没有可用的更新链接' })
+  }
+  if (!isDirectSourceScriptUrl(updateUrl)) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: '更新链接不是可直接下载的脚本，请打开说明页手动更新',
+      data: { updateUrl },
+    })
+  }
+  const script = await fetchSourceScript(updateUrl)
+  return await saveSourceScript(id, { script })
 }
 
 export type FileUploadConflict = {
@@ -608,14 +705,14 @@ export function previewSourcesFromFiles(files: Array<{ name: string; script: str
 export async function applySourcesFromFiles(
   files: Array<{ name: string; script: string }>,
   onConflict: 'overwrite' | 'skip',
-  opts?: { onProgress?: SourceProgressReporter },
+  opts?: SourceBatchHandlers,
 ): Promise<{
   total: number
   imported: number
   overwritten: number
   skipped: number
   failed: number
-  timedOut: boolean
+  cancelled?: boolean
   results: Array<Record<string, any>>
 }> {
   const items = buildFileUploadItems(files)
@@ -627,10 +724,22 @@ export async function applySourcesFromFiles(
   let skipped = 0
   let failed = 0
   let timedOut = false
+  let cancelled = false
 
   for (let i = 0; i < items.length; i++) {
     const index = i + 1
     const item = items[i]!
+
+    if (opts?.signal?.aborted) {
+      cancelled = true
+      break
+    }
+    try {
+      assertBatchNotAborted(opts?.signal)
+    } catch {
+      cancelled = true
+      break
+    }
 
     if (deadline.isExpired()) {
       timedOut = true
@@ -678,6 +787,8 @@ export async function applySourcesFromFiles(
               const row = await addSourceFromScript({
                 name: item.name,
                 script: item.script,
+                onLog: opts?.onLog,
+                logIndex: index,
                 onPhase: async (status) => {
                   await reportProgress(opts?.onProgress, {
                     index,
@@ -700,6 +811,7 @@ export async function applySourcesFromFiles(
             await saveSourceScript(existing.id, {
               script: item.script,
               name: item.name,
+              onLog: opts?.onLog,
               onPhase: async (status) => {
                 await reportProgress(opts?.onProgress, {
                   index,
@@ -720,6 +832,7 @@ export async function applySourcesFromFiles(
           })(),
           SOURCE_ITEM_TIMEOUT_MS,
           `音源「${item.name}」`,
+          opts?.signal,
         )
         continue
       }
@@ -729,6 +842,8 @@ export async function applySourcesFromFiles(
           const row = await addSourceFromScript({
             name: item.name,
             script: item.script,
+            onLog: opts?.onLog,
+            logIndex: index,
             onPhase: async (status) => {
               await reportProgress(opts?.onProgress, {
                 index,
@@ -749,8 +864,13 @@ export async function applySourcesFromFiles(
         })(),
         SOURCE_ITEM_TIMEOUT_MS,
         `音源「${item.name}」`,
+        opts?.signal,
       )
     } catch (err: any) {
+      if (err?.name === 'AbortError' || opts?.signal?.aborted) {
+        cancelled = true
+        break
+      }
       failed += 1
       const message = err?.message || String(err)
       await reportProgress(opts?.onProgress, {
@@ -764,7 +884,7 @@ export async function applySourcesFromFiles(
     }
   }
 
-  return { total, imported, overwritten, skipped, failed, timedOut, results }
+  return { total, imported, overwritten, skipped, failed, timedOut, cancelled, results }
 }
 
 export function deleteSource(id: string) {
@@ -783,7 +903,7 @@ export function deleteSource(id: string) {
 
 export async function checkSources(
   ids?: string[],
-  opts?: { onProgress?: SourceProgressReporter },
+  opts?: SourceBatchHandlers,
 ) {
   const rows = ids?.length
     ? (ids.map((id) => getSource(id)).filter(Boolean) as SourceRow[])
@@ -792,10 +912,22 @@ export async function checkSources(
   const deadline = createBatchDeadline(total)
   const out = []
   let timedOut = false
+  let cancelled = false
 
   for (let i = 0; i < rows.length; i++) {
     const index = i + 1
     const row = rows[i]!
+
+    if (opts?.signal?.aborted) {
+      cancelled = true
+      break
+    }
+    try {
+      assertBatchNotAborted(opts?.signal)
+    } catch {
+      cancelled = true
+      break
+    }
 
     if (deadline.isExpired()) {
       timedOut = true
@@ -817,66 +949,73 @@ export async function checkSources(
       await withTimeout(
         (async () => {
           const ts = nowIso()
-          const guard = acquireSourceRejectionGuard()
-          try {
-            if (!row.local_path || !existsSync(row.local_path)) {
-              await reportProgress(opts?.onProgress, {
-                index,
-                total,
-                name: row.name,
-                status: 'loading',
-              })
-              await upsertSourceFromRemote({
-                name: row.name,
-                url: row.url,
-                mirrorUrl: row.mirror_url || undefined,
-              })
-              const latest = getSource(row.id)
-              out.push({
-                id: row.id,
-                status: latest?.status || 'unknown',
-                error: latest?.last_error || undefined,
-              })
-            } else {
-              await reportProgress(opts?.onProgress, {
-                index,
-                total,
-                name: row.name,
-                status: 'checking',
-              })
-              const handle = await loadLxSource(row.local_path, { bypassCache: true })
-              const netErrs = await settleSourceNetworkErrors(guard)
-              if (netErrs.length) {
-                const msg = `更新检测失败: ${netErrs[0]!.message}`
-                getDb()
-                  .prepare(
-                    `UPDATE sources SET status=?, platforms=?, last_checked_at=?, last_error=?, updated_at=? WHERE id=?`,
-                  )
-                  .run('dead', JSON.stringify(handle.platforms), ts, msg, ts, row.id)
-                out.push({ id: row.id, status: 'dead', error: msg })
-              } else {
-                getDb()
-                  .prepare(
-                    `UPDATE sources SET status=?, platforms=?, last_checked_at=?, last_error=?, updated_at=? WHERE id=?`,
-                  )
-                  .run('ok', JSON.stringify(handle.platforms), ts, null, ts, row.id)
-                out.push({ id: row.id, status: 'ok' })
-              }
-            }
+          if (!row.local_path || !existsSync(row.local_path)) {
             await reportProgress(opts?.onProgress, {
               index,
               total,
               name: row.name,
-              status: 'done',
+              status: 'loading',
             })
-          } finally {
-            guard.release()
+            await upsertSourceFromRemote({
+              name: row.name,
+              url: row.url,
+              mirrorUrl: row.mirror_url || undefined,
+              onLog: opts?.onLog,
+              logIndex: index,
+            })
+            const latest = getSource(row.id)
+            out.push({
+              id: row.id,
+              status: latest?.status || 'unknown',
+              error: latest?.last_error || undefined,
+            })
+          } else {
+            await reportProgress(opts?.onProgress, {
+              index,
+              total,
+              name: row.name,
+              status: 'checking',
+            })
+            const probed = await probeLocalScript(row.local_path, {
+              onLog: opts?.onLog,
+              name: row.name,
+              index,
+            })
+            getDb()
+              .prepare(
+                `UPDATE sources SET status=?, platforms=?, last_checked_at=?, last_error=?, update_info_json=?, updated_at=? WHERE id=?`,
+              )
+              .run(
+                probed.status,
+                JSON.stringify(probed.platforms),
+                ts,
+                probed.lastError,
+                encodeUpdateInfo(probed.updateInfo),
+                ts,
+                row.id,
+              )
+            if (probed.status === 'dead') {
+              out.push({ id: row.id, status: 'dead', error: probed.lastError || undefined })
+            } else {
+              out.push({ id: row.id, status: 'ok' })
+            }
           }
+          await reportProgress(opts?.onProgress, {
+            index,
+            total,
+            name: row.name,
+            status: 'done',
+          })
         })(),
         SOURCE_ITEM_TIMEOUT_MS,
         `音源「${row.name}」`,
+        opts?.signal,
       )
     } catch (err: any) {
+      if (err?.name === 'AbortError' || opts?.signal?.aborted) {
+        cancelled = true
+        break
+      }
       const ts = nowIso()
       const message = err?.message || String(err)
       getDb()
@@ -893,7 +1032,7 @@ export async function checkSources(
     }
   }
 
-  return { items: out, timedOut, total }
+  return { items: out, timedOut, total, cancelled }
 }
 
 export async function cleanupDeadSources(

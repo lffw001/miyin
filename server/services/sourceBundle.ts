@@ -11,12 +11,13 @@ import {
   type SourceRow,
 } from './sourceRegistry'
 import { allocateUniqueName, cleanSourceName } from './sourceImport'
-import type { SourceProgressReporter } from '#shared/sourceBatchProgress'
+import type { SourceBatchHandlers } from '#shared/sourceBatchProgress'
 import {
   SOURCE_ITEM_TIMEOUT_MS,
   createBatchDeadline,
   reportProgress,
   withTimeout,
+  assertBatchNotAborted,
 } from '../utils/sourceBatchTimeout'
 
 export const BUNDLE_VERSION = 1
@@ -228,7 +229,7 @@ export function previewSourcesBundle(zipBuffer: Buffer) {
 export async function applySourcesBundle(
   zipBuffer: Buffer,
   onConflict: 'overwrite' | 'skip',
-  opts?: { onProgress?: SourceProgressReporter },
+  opts?: SourceBatchHandlers,
 ): Promise<{
   total: number
   imported: number
@@ -247,10 +248,22 @@ export async function applySourcesBundle(
   let skipped = 0
   let failed = 0
   let timedOut = false
+  let cancelled = false
 
   for (let i = 0; i < items.length; i++) {
     const index = i + 1
     const item = items[i]!
+
+    if (opts?.signal?.aborted) {
+      cancelled = true
+      break
+    }
+    try {
+      assertBatchNotAborted(opts?.signal)
+    } catch {
+      cancelled = true
+      break
+    }
 
     if (deadline.isExpired()) {
       timedOut = true
@@ -308,6 +321,7 @@ export async function applySourcesBundle(
             await saveSourceScript(targetId, {
               script: item.script,
               name,
+              onLog: opts?.onLog,
               onPhase: async (status) => {
                 await reportProgress(opts?.onProgress, {
                   index,
@@ -331,6 +345,7 @@ export async function applySourcesBundle(
           })(),
           SOURCE_ITEM_TIMEOUT_MS,
           `音源「${item.name}」`,
+          opts?.signal,
         )
         continue
       }
@@ -343,6 +358,8 @@ export async function applySourcesBundle(
             url: item.url,
             script: item.script,
             enabled: item.enabled,
+            onLog: opts?.onLog,
+            logIndex: index,
             onPhase: async (status) => {
               await reportProgress(opts?.onProgress, {
                 index,
@@ -363,8 +380,13 @@ export async function applySourcesBundle(
         })(),
         SOURCE_ITEM_TIMEOUT_MS,
         `音源「${item.name}」`,
+        opts?.signal,
       )
     } catch (err: any) {
+      if (err?.name === 'AbortError' || opts?.signal?.aborted) {
+        cancelled = true
+        break
+      }
       failed += 1
       const message = err?.message || String(err)
       await reportProgress(opts?.onProgress, {
@@ -390,6 +412,7 @@ export async function applySourcesBundle(
     skipped,
     failed,
     timedOut,
+    cancelled,
     results,
   }
 }

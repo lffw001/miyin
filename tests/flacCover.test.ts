@@ -1,34 +1,65 @@
 import { describe, it, expect } from 'vitest'
-import { copyFileSync, readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, readFileSync, existsSync, mkdtempSync, rmSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { writeAudioMetadata, flacHasPictureBlock } from '../server/services/metadataService'
+
+/**
+ * 样本来自本地 downloads 目录；不要求它恰好无封面——若已含 PICTURE 块，
+ * 测试内先用 ffmpeg 剥离，保证「无封面」前置条件由测试自己构造。
+ * （必须用不含 PICTURE 的样本：若样本本身已有封面，`-map 0 -c copy` 会保留旧封面，
+ * 导致即使封面下载/转换失败也能「通过」。）
+ */
+const SAMPLE = '/Users/huangdongliang/code/miyin/downloads/毛不易 - 消愁.flac'
+const COVER_URL =
+  'https://p1.music.126.net/vmCcDvD1H04e9gm97xsCqg==/109951163350929740.jpg'
+
+/** 剥离 FLAC 中已有的封面流（-vn 去视频流，音频 -c copy 不重编码） */
+function stripFlacCover(src: string): string {
+  const out = `${src}.stripped.flac`
+  const r = spawnSync(
+    'ffmpeg',
+    ['-y', '-i', src, '-map', '0:a', '-c:a', 'copy', '-vn', out],
+    { stdio: 'ignore' },
+  )
+  if (r.status !== 0 || !existsSync(out)) {
+    throw new Error('ffmpeg 剥离样本封面失败，无法构造无封面样本')
+  }
+  return out
+}
 
 describe('flac cover embed', () => {
   it(
-    'embeds jpeg picture block for flac',
+    'embeds jpeg picture block for coverless flac',
     async () => {
-      const sample = '/Users/huangdongliang/code/miyin/downloads/邓垚 - 诀别书.flac'
-      if (!existsSync(sample)) return
+      if (!existsSync(SAMPLE)) return
+
       const dir = mkdtempSync(join(tmpdir(), 'miyin-flac-cover-'))
       const src = join(dir, 'sample.flac')
       try {
-        copyFileSync(sample, src)
+        copyFileSync(SAMPLE, src)
+        if (flacHasPictureBlock(src)) {
+          const stripped = stripFlacCover(src)
+          copyFileSync(stripped, src)
+        }
+        expect(flacHasPictureBlock(src)).toBe(false)
+
         const r = await writeAudioMetadata(
           src,
           {
-            title: '诀别书',
-            artist: '邓垚',
-            album: '诀别书',
+            title: '消愁',
+            artist: '毛不易',
+            album: '平凡的一天',
             platform: 'wy',
             quality: 'flac',
-            external_id: '2038191895',
+            external_id: '569200213',
           },
           {
-            name: '诀别书',
-            singer: '邓垚',
-            albumName: '诀别书',
-            img: 'http://p2.music.126.net/wztA5smxFjIfv98u7-IrQQ==/109951168933355255.jpg',
+            name: '消愁',
+            singer: '毛不易',
+            albumName: '平凡的一天',
+            img: COVER_URL,
           },
           null,
         )

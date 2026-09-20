@@ -3,19 +3,32 @@ import { APP_NAV_LINKS, navLinkActive } from '~/utils/nav'
 
 const route = useRoute()
 const { activeCount } = useDownloadEvents()
+const { showBadge: showUpdateBadge, requestOpenOnSettings } = useAppUpdate()
+const { bottom: safeAreaBottom } = useScreenSafeArea()
+
+const bottomNavStyle = computed(() => ({
+  // useScreenSafeArea 返回已解析的 inset 字符串（如 "34px"），比纯 CSS env() 在部分 WebView 更稳
+  paddingBottom: `calc(6px + ${safeAreaBottom.value || '0px'})`,
+}))
+
+function onNavClick(to: string) {
+  if (to === '/settings' && showUpdateBadge.value) requestOpenOnSettings()
+}
 </script>
 
 <template>
-  <nav class="bottom-nav" aria-label="主导航">
+  <nav class="bottom-nav" aria-label="主导航" :style="bottomNavStyle">
     <NuxtLink
       v-for="l in APP_NAV_LINKS"
       :key="l.to"
       :to="l.to"
       class="tab"
       :class="{ active: navLinkActive(route.path, l.to) }"
+      @click="onNavClick(l.to)"
     >
       <span class="label">{{ l.short }}</span>
       <span v-if="l.badge && activeCount > 0" class="badge">{{ activeCount > 99 ? '99+' : activeCount }}</span>
+      <span v-if="l.to === '/settings' && showUpdateBadge" class="dot-badge" aria-hidden="true" />
     </NuxtLink>
   </nav>
 </template>
@@ -29,7 +42,7 @@ const { activeCount } = useDownloadEvents()
   flex-shrink: 0;
   grid-template-columns: repeat(5, 1fr);
   gap: 2px;
-  padding: 6px 4px calc(6px + env(safe-area-inset-bottom, 0px));
+  padding: 6px 4px 6px;
   background: color-mix(in oklab, var(--surface) 92%, transparent);
   border-top: 1px solid var(--border);
   backdrop-filter: blur(12px);
@@ -72,6 +85,15 @@ const { activeCount } = useDownloadEvents()
   font-weight: 700;
   line-height: 16px;
   text-align: center;
+}
+.dot-badge {
+  position: absolute;
+  top: 4px;
+  right: 22%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
 }
 
 @media (max-width: 768px) {

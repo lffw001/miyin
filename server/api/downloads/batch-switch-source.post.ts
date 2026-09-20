@@ -5,12 +5,14 @@ export default defineEventHandler(async (event) => {
     ids?: string[]
     sourceId?: string
     sourceById?: Record<string, string>
+    allWithTab?: 'failed'
   }>(event)
-  if (!body?.ids?.length) {
-    throw createError({ statusCode: 400, statusMessage: 'ids 必填' })
+  if (!body?.ids?.length && body?.allWithTab !== 'failed') {
+    throw createError({ statusCode: 400, statusMessage: '请提供 ids 或 allWithTab: "failed"' })
   }
-  return batchSwitchSourceAndRetry(body.ids, {
+  return batchSwitchSourceAndRetry(body.ids || [], {
     sourceId: body.sourceId,
     sourceById: body.sourceById,
+    tab: body.allWithTab,
   })
 })

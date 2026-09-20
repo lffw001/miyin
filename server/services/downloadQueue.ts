@@ -6,12 +6,14 @@ import {
   statSync,
   writeFileSync,
   renameSync,
+  mkdirSync,
 } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { getDb } from '../utils/db'
+import PQueue from 'p-queue'
+import { getDb, checkpointAndShrinkDb } from '../utils/db'
 import { getDownloadDir } from '../utils/paths'
 import {
   assertDownloadDirWritable,
@@ -35,9 +37,8 @@ import {
   previewUrlError,
   probeAudioDurationSeconds,
 } from '../utils/audioPreview'
-import { nextStatusAfterFailure, isRetryableError } from './downloadState'
+import { nextStatusAfterFailure, isRetryableError, isAllowedQuality } from './downloadState'
 import { msUntilCanStartTask } from '../utils/downloadIntervals'
-
 export type { TaskStatus } from './downloadState'
 export { nextStatusAfterFailure, isRetryableError } from './downloadState'
 
@@ -69,14 +70,39 @@ export type DownloadTaskRow = {
 export const downloadEvents = new EventEmitter()
 downloadEvents.setMaxListeners(50)
 
-let running = 0
+let downloadQueue: PQueue | null = null
+let currentQueueConcurrency = 1
 let loopTimer: NodeJS.Timeout | null = null
 let intervalKickTimer: NodeJS.Timeout | null = null
 /** 上次启动任务时间戳（ms） */
 let lastStartedAt: number | null = null
 /** 上次任务结束时间戳（ms，成功/失败/取消均计） */
 let lastFinishedAt: number | null = null
-const cancelSet = new Set<string>()
+let idleShrinkTimer: NodeJS.Timeout | null = null
+const activeAbortControllers = new Map<string, AbortController>()
+const activeProcessingTasks = new Set<string>()
+const inFlightQueueTaskIds = new Set<string>()
+let isTicking = false
+function scheduleIdleShrinkDb() {
+  if (idleShrinkTimer) clearTimeout(idleShrinkTimer)
+  idleShrinkTimer = setTimeout(() => {
+    idleShrinkTimer = null
+    if (activeProcessingTasks.size === 0 && (!downloadQueue || downloadQueue.pending === 0)) {
+      checkpointAndShrinkDb()
+    }
+  }, 5000)
+}
+
+function getOrCreateDownloadQueue(concurrency: number): PQueue {
+  if (!downloadQueue) {
+    downloadQueue = new PQueue({ concurrency, autoStart: true })
+    currentQueueConcurrency = concurrency
+  } else if (downloadQueue.concurrency !== concurrency) {
+    downloadQueue.concurrency = concurrency
+    currentQueueConcurrency = concurrency
+  }
+  return downloadQueue
+}
 
 function scheduleKickAfter(ms: number) {
   if (ms <= 0) {
@@ -94,10 +120,25 @@ function nowIso() {
   return new Date().toISOString()
 }
 
-function sanitizeFilename(name: string) {
-  return name.replace(/[\\/:*?"<>|]/g, '_').trim() || 'unknown'
+/** Sanitize one path segment; `/` `\` become `_` so metadata cannot inject directories. */
+function sanitizePathSegment(name: string) {
+  return name.replace(/[\\/:*?"<>|]/g, '_').trim()
 }
 
+/** Split a filled template into sanitized relative path segments (`/` as dirs). */
+function pathSegmentsFromFilled(filled: string, emptyFallback?: string) {
+  const segments = filled
+    .split(/[/\\]+/)
+    .map((s) => sanitizePathSegment(s))
+    .filter((s) => s && s !== '.' && s !== '..')
+  if (segments.length) return segments.join('/')
+  return emptyFallback ?? ''
+}
+
+/**
+ * Apply download name template. `/` or `\` in the template create subdirectories;
+ * each segment is sanitized. Empty segments (e.g. missing `{album}`) and `.` / `..` are dropped.
+ */
 export function applyNameTemplate(
   template: string,
   meta: {
@@ -110,23 +151,185 @@ export function applyNameTemplate(
     track?: string | number
   },
 ) {
-  return sanitizeFilename(
-    template
-      .replaceAll('{artist}', meta.artist || '未知')
-      .replaceAll('{title}', meta.title || '未知')
-      .replaceAll('{album}', meta.album || '')
-      .replaceAll('{platform}', meta.platform || '')
-      .replaceAll('{quality}', meta.quality || '')
-      .replaceAll('{id}', meta.id || '')
-      .replaceAll('{track}', meta.track != null ? String(meta.track) : ''),
-  )
+  const filled = template
+    .replaceAll('{artist}', sanitizePathSegment(meta.artist || '未知') || '未知')
+    .replaceAll('{title}', sanitizePathSegment(meta.title || '未知') || '未知')
+    .replaceAll('{album}', sanitizePathSegment(meta.album || ''))
+    .replaceAll('{platform}', sanitizePathSegment(meta.platform || ''))
+    .replaceAll('{quality}', sanitizePathSegment(meta.quality || ''))
+    .replaceAll('{id}', sanitizePathSegment(meta.id || ''))
+    .replaceAll(
+      '{track}',
+      meta.track != null ? sanitizePathSegment(String(meta.track)) : '',
+    )
+
+  return pathSegmentsFromFilled(filled, 'unknown')
 }
 
-export function listTasks(status?: string) {
-  if (status) {
-    return getDb().prepare('SELECT * FROM download_tasks WHERE status = ? ORDER BY created_at DESC').all(status) as DownloadTaskRow[]
+/** Album-level folder template (`{album}` / `{artist}` / `{platform}`); empty if nothing left. */
+export function applyFolderTemplate(
+  template: string,
+  meta: { album?: string; artist?: string; platform?: string },
+) {
+  const filled = template
+    .replaceAll('{artist}', sanitizePathSegment(meta.artist || ''))
+    .replaceAll('{album}', sanitizePathSegment(meta.album || ''))
+    .replaceAll('{platform}', sanitizePathSegment(meta.platform || ''))
+  return pathSegmentsFromFilled(filled, '')
+}
+
+/** File name from global template, optionally under a resolved album folder prefix. */
+export function buildDownloadRelativeBase(
+  nameTemplate: string,
+  trackMeta: {
+    artist: string
+    title: string
+    album?: string
+    platform?: string
+    quality?: string
+    id?: string
+    track?: string | number
+  },
+  folderPrefix?: string | null,
+) {
+  const fileBase = applyNameTemplate(nameTemplate, trackMeta)
+  const prefix = pathSegmentsFromFilled(folderPrefix || '', '')
+  return prefix ? `${prefix}/${fileBase}` : fileBase
+}
+
+/** Join download root with a template-relative base (may contain `/` segments). */
+export function joinDownloadRelative(root: string, relativeBase: string, ext?: string) {
+  const parts = relativeBase.split('/').filter(Boolean)
+  if (ext) {
+    const last = parts.pop() || 'unknown'
+    parts.push(`${last}.${ext}`)
   }
-  return getDb().prepare('SELECT * FROM download_tasks ORDER BY created_at DESC LIMIT 200').all() as DownloadTaskRow[]
+  return join(root, ...parts)
+}
+
+function ensureParentDir(filePath: string) {
+  mkdirSync(dirname(filePath), { recursive: true })
+}
+
+export type ListTasksQuery = {
+  status?: string
+  statuses?: string[]
+  tab?: 'running' | 'completed' | 'failed'
+  playlistUrl?: string
+  batchId?: string
+  page?: number
+  pageSize?: number
+  limit?: number
+}
+
+export function listTasks(queryOrStatus?: string | ListTasksQuery) {
+  if (typeof queryOrStatus === 'string') {
+    return getDb()
+      .prepare('SELECT * FROM download_tasks WHERE status = ? ORDER BY created_at DESC')
+      .all(queryOrStatus) as DownloadTaskRow[]
+  }
+  const q = queryOrStatus || {}
+  const whereClauses: string[] = []
+  const params: unknown[] = []
+
+  if (q.tab) {
+    if (q.tab === 'running') {
+      whereClauses.push(`status IN ('running', 'queued')`)
+    } else if (q.tab === 'completed') {
+      whereClauses.push(`status = 'completed'`)
+    } else if (q.tab === 'failed') {
+      whereClauses.push(`status IN ('failed', 'cancelled')`)
+    }
+  } else if (q.statuses && q.statuses.length > 0) {
+    const placeholders = q.statuses.map(() => '?').join(',')
+    whereClauses.push(`status IN (${placeholders})`)
+    params.push(...q.statuses)
+  } else if (q.status) {
+    whereClauses.push('status = ?')
+    params.push(q.status)
+  }
+
+  if (q.playlistUrl) {
+    whereClauses.push('playlist_url = ?')
+    params.push(q.playlistUrl)
+  }
+  if (q.batchId) {
+    whereClauses.push('batch_id = ?')
+    params.push(q.batchId)
+  }
+
+  const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
+  let orderBySql = 'ORDER BY created_at DESC'
+  if (q.tab === 'running') {
+    // 下载中（running）排在最前，排队中（queued）按入队先后顺序排列
+    orderBySql = `ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END ASC, created_at ASC`
+  } else if (q.tab === 'completed') {
+    orderBySql = `ORDER BY updated_at DESC, created_at DESC`
+  }
+
+  const page = q.page && q.page > 0 ? q.page : undefined
+  const pageSize = q.pageSize && q.pageSize > 0 ? Math.min(q.pageSize, 1000) : undefined
+
+  if (page && pageSize) {
+    const offset = (page - 1) * pageSize
+    return getDb()
+      .prepare(`SELECT * FROM download_tasks ${whereSql} ${orderBySql} LIMIT ? OFFSET ?`)
+      .all(...params, pageSize, offset) as DownloadTaskRow[]
+  }
+
+  const limit = q.limit && q.limit > 0 ? q.limit : 200
+  return getDb()
+    .prepare(`SELECT * FROM download_tasks ${whereSql} ${orderBySql} LIMIT ?`)
+    .all(...params, limit) as DownloadTaskRow[]
+}
+
+export type TaskStats = {
+  total: number
+  completed: number
+  failed: number
+  running: number
+  queued: number
+  cancelled: number
+}
+
+export function getTaskStats(filter?: { playlistUrl?: string; batchId?: string }): TaskStats {
+  const whereClauses: string[] = []
+  const params: unknown[] = []
+
+  if (filter?.playlistUrl) {
+    whereClauses.push('playlist_url = ?')
+    params.push(filter.playlistUrl)
+  }
+  if (filter?.batchId) {
+    whereClauses.push('batch_id = ?')
+    params.push(filter.batchId)
+  }
+
+  const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
+  const rows = getDb()
+    .prepare(`SELECT status, count(*) as count FROM download_tasks ${whereSql} GROUP BY status`)
+    .all(...params) as Array<{ status: string; count: number }>
+
+  const stats: TaskStats = {
+    total: 0,
+    completed: 0,
+    failed: 0,
+    running: 0,
+    queued: 0,
+    cancelled: 0,
+  }
+
+  for (const row of rows) {
+    const count = Number(row.count) || 0
+    stats.total += count
+    if (row.status === 'completed') stats.completed = count
+    else if (row.status === 'failed') stats.failed = count
+    else if (row.status === 'running') stats.running = count
+    else if (row.status === 'queued') stats.queued = count
+    else if (row.status === 'cancelled') stats.cancelled = count
+  }
+
+  return stats
 }
 
 export function getTask(id: string) {
@@ -152,21 +355,28 @@ function removeTaskFiles(task: DownloadTaskRow) {
   removeFileQuiet(task.lyric_path)
 }
 
-export function enqueueDownload(input: {
+export type EnqueueDownloadInput = {
   title: string
   artist: string
   album?: string
   platform: string
   sourceId?: string
   quality?: string
-  musicInfo: Record<string, any>
+  musicInfo: Record<string, unknown>
   externalId?: string
   matchMethod?: string
   downloadLyric?: boolean
   lyricMode?: 'external' | 'embedded'
+  /** Resolved relative folder prefix for this task (album download); stored in music_info_json */
+  folderPrefix?: string
   batchId?: string
   playlistUrl?: string
-}) {
+}
+
+export function enqueueDownload(input: EnqueueDownloadInput) {
+  if (input.quality != null && input.quality !== '' && !isAllowedQuality(input.quality)) {
+    throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${input.quality}` })
+  }
   const settings = getSettings()
   assertDownloadDirWritable(settings.downloadDir)
 
@@ -182,6 +392,7 @@ export function enqueueDownload(input: {
     ...input.musicInfo,
     __downloadLyric: input.downloadLyric ?? settings.downloadLyric,
     __lyricMode: input.lyricMode ?? settings.lyricMode,
+    ...(input.folderPrefix ? { __folderPrefix: input.folderPrefix } : {}),
   }
 
   getDb()
@@ -212,10 +423,116 @@ export function enqueueDownload(input: {
   return getTask(id)!
 }
 
+/**
+ * 批量任务入库：使用 SQLite 事务进行高效分批写入，避免循环单个 insert 导致的 WAL 和事件广播压力。
+ */
+export function batchEnqueueDownload(
+  items: EnqueueDownloadInput[],
+  opts?: { silent?: boolean },
+): { total: number; enqueued: number; ids: string[] } {
+  if (!items.length) return { total: 0, enqueued: 0, ids: [], results: [] }
+
+  const settings = getSettings()
+  assertDownloadDirWritable(settings.downloadDir)
+
+  const db = getDb()
+  const sourceCache = new Map<string, string | undefined>()
+  const getSourceForPlatform = (platform: string) => {
+    if (sourceCache.has(platform)) return sourceCache.get(platform)
+    const sources = listEnabledOkSources(platform)
+    const sid = sources[0]?.id
+    sourceCache.set(platform, sid)
+    return sid
+  }
+
+  const insertStmt = db.prepare(
+    `INSERT INTO download_tasks (
+      id, title, artist, album, platform, source_id, quality, status, progress,
+      external_id, match_method, batch_id, playlist_url, music_info_json, file_size, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+  )
+
+  const enqueuedIds: string[] = []
+  const itemResults: Array<{ ok: boolean; id?: string; error?: string }> = []
+  const ts = nowIso()
+
+  const runInsertTransaction = db.transaction((taskList: EnqueueDownloadInput[]) => {
+    for (const item of taskList) {
+      if (item.quality != null && item.quality !== '' && !isAllowedQuality(item.quality)) {
+        itemResults.push({
+          ok: false,
+          error: `不支持的音质: ${item.quality}`,
+        })
+        continue
+      }
+      const sourceId = item.sourceId || getSourceForPlatform(item.platform)
+      if (!sourceId) {
+        itemResults.push({
+          ok: false,
+          error: `没有可用音源支持平台 ${item.platform}`,
+        })
+        continue
+      }
+
+      const id = randomUUID()
+      const musicPayload = {
+        ...item.musicInfo,
+        __downloadLyric: item.downloadLyric ?? settings.downloadLyric,
+        __lyricMode: item.lyricMode ?? settings.lyricMode,
+        ...(item.folderPrefix ? { __folderPrefix: item.folderPrefix } : {}),
+      }
+
+      insertStmt.run(
+        id,
+        item.title,
+        item.artist,
+        item.album || null,
+        item.platform,
+        sourceId,
+        item.quality || settings.defaultQuality,
+        item.externalId || null,
+        item.matchMethod || 'id',
+        item.batchId || null,
+        item.playlistUrl || null,
+        JSON.stringify(musicPayload),
+        ts,
+        ts,
+      )
+      enqueuedIds.push(id)
+      itemResults.push({ ok: true, id })
+    }
+  })
+
+  // 分块事务提交（每 200 条一次事务），降低单事务锁占用与 WAL 峰值
+  const CHUNK_SIZE = 200
+  for (let i = 0; i < items.length; i += CHUNK_SIZE) {
+    const chunk = items.slice(i, i + CHUNK_SIZE)
+    runInsertTransaction(chunk)
+  }
+
+  if (!opts?.silent) {
+    for (const id of enqueuedIds) {
+      emitTask(id)
+    }
+  }
+  downloadEvents.emit('batch_enqueued', { count: enqueuedIds.length, ids: enqueuedIds })
+  kickWorker()
+
+  return {
+    total: items.length,
+    enqueued: enqueuedIds.length,
+    ids: enqueuedIds,
+    results: itemResults,
+  }
+}
+
 export function cancelTask(id: string) {
   const task = getTask(id)
   if (!task) throw createError({ statusCode: 404, statusMessage: '任务不存在' })
-  cancelSet.add(id)
+  const controller = activeAbortControllers.get(id)
+  if (controller) {
+    controller.abort()
+  }
 
   // 若刚好已完成：按约定删除成品文件并标为取消
   if (task.status === 'completed') {
@@ -241,18 +558,24 @@ export function cancelTask(id: string) {
   return getTask(id)!
 }
 
-export function batchCancelTasks(ids: string[]) {
+export function batchCancelTasks(ids?: string[], opts?: { tab?: 'running' }) {
+  const targetIds: string[] = []
+  if (ids && ids.length > 0) {
+    targetIds.push(...ids)
+  } else if (opts?.tab === 'running') {
+    const rows = getDb().prepare(`SELECT id FROM download_tasks WHERE status IN ('running', 'queued')`).all() as Array<{ id: string }>
+    targetIds.push(...rows.map((r) => r.id))
+  }
   const items = []
-  for (const id of ids) {
+  for (const id of targetIds) {
     try {
       items.push(cancelTask(id))
     } catch (e: any) {
       items.push({ id, error: e?.message || String(e) })
     }
   }
-  return { count: ids.length, items }
+  return { count: targetIds.length, items }
 }
-
 /** 删除任务记录；可选删除本地音频与歌词 */
 export function deleteTask(id: string, opts?: { deleteLocalFiles?: boolean }) {
   const task = getTask(id)
@@ -266,10 +589,20 @@ export function deleteTask(id: string, opts?: { deleteLocalFiles?: boolean }) {
   return { ok: true, id }
 }
 
-export function batchDeleteTasks(ids: string[], opts?: { deleteLocalFiles?: boolean }) {
+export function batchDeleteTasks(ids?: string[], opts?: { deleteLocalFiles?: boolean; tab?: 'completed' | 'failed' }) {
+  const targetIds: string[] = []
+  if (ids && ids.length > 0) {
+    targetIds.push(...ids)
+  } else if (opts?.tab === 'completed') {
+    const rows = getDb().prepare(`SELECT id FROM download_tasks WHERE status = 'completed'`).all() as Array<{ id: string }>
+    targetIds.push(...rows.map((r) => r.id))
+  } else if (opts?.tab === 'failed') {
+    const rows = getDb().prepare(`SELECT id FROM download_tasks WHERE status IN ('failed', 'cancelled')`).all() as Array<{ id: string }>
+    targetIds.push(...rows.map((r) => r.id))
+  }
   let deleted = 0
   const errors: Array<{ id: string; error: string }> = []
-  for (const id of ids) {
+  for (const id of targetIds) {
     try {
       deleteTask(id, opts)
       deleted += 1
@@ -292,11 +625,8 @@ export function retryTask(id: string, opts?: { resetAttempts?: boolean; quality?
   assertDownloadDirWritable(settings.downloadDir)
 
   const quality = opts?.quality?.trim()
-  if (quality) {
-    const allowed = new Set(['highest', 'flac24bit', 'flac', '320k', '128k'])
-    if (!allowed.has(quality)) {
-      throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${quality}` })
-    }
+  if (quality && !isAllowedQuality(quality)) {
+    throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${quality}` })
   }
 
   getDb()
@@ -319,8 +649,7 @@ export function switchQualityAndRetry(id: string, quality: string) {
   if (task.status === 'running' || task.status === 'queued') {
     throw createError({ statusCode: 400, statusMessage: '任务进行中，请先取消再换音质' })
   }
-  const allowed = new Set(['highest', 'flac24bit', 'flac', '320k', '128k'])
-  if (!allowed.has(quality)) {
+  if (!isAllowedQuality(quality)) {
     throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${quality}` })
   }
 
@@ -344,9 +673,16 @@ export function switchQualityAndRetry(id: string, quality: string) {
   }
 }
 
-export function batchRetryTasks(ids: string[], opts?: { resetAttempts?: boolean }) {
+export function batchRetryTasks(ids?: string[], opts?: { resetAttempts?: boolean; tab?: 'failed' }) {
+  const targetIds: string[] = []
+  if (ids && ids.length > 0) {
+    targetIds.push(...ids)
+  } else if (opts?.tab === 'failed') {
+    const rows = getDb().prepare(`SELECT id FROM download_tasks WHERE status IN ('failed', 'cancelled')`).all() as Array<{ id: string }>
+    targetIds.push(...rows.map((r) => r.id))
+  }
   const items = []
-  for (const id of ids) {
+  for (const id of targetIds) {
     try {
       items.push(retryTask(id, opts))
     } catch (e: any) {
@@ -354,7 +690,40 @@ export function batchRetryTasks(ids: string[], opts?: { resetAttempts?: boolean 
     }
   }
   kickWorker()
-  return { count: ids.length, items }
+  return { count: targetIds.length, items }
+}
+
+function resolveFailedTabTaskIds(ids?: string[], tab?: 'failed'): string[] {
+  if (ids?.length) return ids
+  if (tab === 'failed') {
+    const rows = getDb()
+      .prepare(`SELECT id FROM download_tasks WHERE status IN ('failed', 'cancelled')`)
+      .all() as Array<{ id: string }>
+    return rows.map((r) => r.id)
+  }
+  return []
+}
+
+export function batchSwitchQualityAndRetry(
+  ids: string[],
+  quality: string,
+  opts?: { tab?: 'failed' },
+) {
+  if (!isAllowedQuality(quality)) {
+    throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${quality}` })
+  }
+  const targetIds = ids.length ? ids : resolveFailedTabTaskIds(undefined, opts?.tab)
+  const items = []
+  for (const id of targetIds) {
+    try {
+      items.push(switchQualityAndRetry(id, quality))
+    } catch (e: unknown) {
+      const err = e as { statusMessage?: string; message?: string }
+      items.push({ id, error: err?.statusMessage || err?.message || String(e) })
+    }
+  }
+  kickWorker()
+  return { count: targetIds.length, quality, items }
 }
 
 /**
@@ -429,34 +798,76 @@ export function switchSourceAndRetry(id: string, opts?: { sourceId?: string }) {
   }
 }
 
-/** 批量换源：可统一 sourceId，或按任务指定 sourceById */
+/** 批量换源：可统一 sourceId，或按任务指定 sourceById；支持 allWithTab=failed 全选 */
 export function batchSwitchSourceAndRetry(
   ids: string[],
-  opts?: { sourceId?: string; sourceById?: Record<string, string> },
+  opts?: { sourceId?: string; sourceById?: Record<string, string>; tab?: 'failed' },
 ) {
+  const targetIds = ids.length ? ids : resolveFailedTabTaskIds(undefined, opts?.tab)
   const items = []
-  for (const id of ids) {
+  for (const id of targetIds) {
     try {
       const sourceId = opts?.sourceById?.[id] || opts?.sourceId
       items.push(switchSourceAndRetry(id, sourceId ? { sourceId } : undefined))
-    } catch (e: any) {
-      items.push({ id, error: e?.statusMessage || e?.message || String(e) })
+    } catch (e: unknown) {
+      const err = e as { statusMessage?: string; message?: string }
+      items.push({ id, error: err?.statusMessage || err?.message || String(e) })
     }
   }
   kickWorker()
-  return { count: ids.length, items }
+  return { count: targetIds.length, items }
 }
 
-function updateTask(id: string, patch: Partial<DownloadTaskRow>) {
+const lastEmitTimeByTaskId = new Map<string, number>()
+const lastEmitProgressByTaskId = new Map<string, number>()
+
+function updateTask(
+  id: string,
+  patch: Partial<DownloadTaskRow>,
+  opts?: { throttleProgress?: boolean; whereStatus?: string[] },
+) {
   const keys = Object.keys(patch)
-  if (!keys.length) return
+  if (!keys.length) return 0
   const sets = keys.map((k) => `${k} = ?`).join(', ')
-  getDb()
-    .prepare(`UPDATE download_tasks SET ${sets}, updated_at = ? WHERE id = ?`)
-    .run(...keys.map((k) => (patch as any)[k]), nowIso(), id)
+  let sql = `UPDATE download_tasks SET ${sets}, updated_at = ? WHERE id = ?`
+  const runArgs: unknown[] = [...keys.map((k) => (patch as Record<string, unknown>)[k]), nowIso(), id]
+  if (opts?.whereStatus?.length) {
+    sql += ` AND status IN (${opts.whereStatus.map(() => '?').join(',')})`
+    runArgs.push(...opts.whereStatus)
+  }
+  const info = getDb().prepare(sql).run(...runArgs)
+  // CAS 未命中（如任务已被取消/删除）：不广播事件，避免复活脏数据
+  if (info.changes === 0) return 0
+
+  if (opts?.throttleProgress && patch.progress != null) {
+    const now = Date.now()
+    const lastTime = lastEmitTimeByTaskId.get(id) || 0
+    const lastProg = lastEmitProgressByTaskId.get(id) ?? -1
+    const progDiff = Math.abs(patch.progress - lastProg)
+    if (now - lastTime < 250 && progDiff < 0.05 && patch.progress < 0.99) {
+      return info.changes
+    }
+    lastEmitTimeByTaskId.set(id, now)
+    lastEmitProgressByTaskId.set(id, patch.progress)
+  } else {
+    lastEmitTimeByTaskId.delete(id)
+    lastEmitProgressByTaskId.delete(id)
+  }
   emitTask(id)
+  return info.changes
 }
 
+/**
+ * 状态迁移原语（CAS）：仅当任务当前状态 ∈ fromStatuses 时应用 patch。
+ * 保证 cancelled 为终结态 —— worker 侧任何状态回写都不得复活已取消任务。
+ */
+export function applyStatusTransition(
+  id: string,
+  patch: Partial<DownloadTaskRow>,
+  fromStatuses: string[],
+): boolean {
+  return updateTask(id, patch, { whereStatus: fromStatuses }) > 0
+}
 export function ensureDiskWritable(dir: string) {
   return assertDownloadDirWritable(dir)
 }
@@ -481,15 +892,18 @@ async function downloadFile(
   url: string,
   dest: string,
   onProgress: (p: number, received: number, total: number) => void,
-  taskId: string,
+  signal?: AbortSignal,
   opts?: { expectedDurationSec?: number | null; quality?: string | null },
 ) {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'miyin/0.1', Referer: 'https://www.google.com/' },
+    signal,
   })
   if (!res.ok || !res.body) {
     const err = new Error(`下载 HTTP ${res.status}`)
-    ;(err as any).code = res.status >= 500 || res.status === 429 ? 'HTTP_RETRY' : 'HTTP_FATAL'
+    const status = res.status
+    const isRetry = status >= 500 || status === 429
+    Object.assign(err, { code: isRetry ? 'HTTP_RETRY' : 'HTTP_FATAL' })
     throw err
   }
   const total = Number(res.headers.get('content-length') || 0)
@@ -499,11 +913,11 @@ async function downloadFile(
     if (total < minBytes) throw previewSizeError(total, expected)
   }
   let received = 0
-  const nodeStream = Readable.fromWeb(res.body as any)
-  const out = createWriteStream(dest)
+  const nodeStream = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
+  const out = createWriteStream(dest, { highWaterMark: 64 * 1024 })
   try {
     nodeStream.on('data', (chunk: Buffer) => {
-      if (cancelSet.has(taskId)) {
+      if (signal?.aborted) {
         nodeStream.destroy(new Error('cancelled'))
         return
       }
@@ -511,10 +925,10 @@ async function downloadFile(
       if (total > 0) onProgress(Math.min(0.99, received / total), received, total)
       else onProgress(Math.min(0.95, received / (received + 1024 * 1024)), received, 0)
     })
-    await pipeline(nodeStream, out)
+    await pipeline(nodeStream, out, { signal })
     onProgress(1, received, total || received)
     return { received, total: total || received }
-  } catch (err) {
+  } catch (err: unknown) {
     try {
       out.close()
       if (existsSync(dest)) unlinkSync(dest)
@@ -522,50 +936,73 @@ async function downloadFile(
       /* ignore */
     }
     throw err
+  } finally {
+    nodeStream.removeAllListeners()
   }
 }
 
 async function processTask(task: DownloadTaskRow) {
-  const settings = getSettings()
-  updateTask(task.id, { status: 'running', progress: 0.01, error: null })
+  const abortController = new AbortController()
+  activeAbortControllers.set(task.id, abortController)
+  activeProcessingTasks.add(task.id)
+
   let filePath: string | null = null
   let lyricPath: string | null = null
+  const settings = getSettings()
   try {
+    const current = getTask(task.id)
+    if (!current || current.status === 'cancelled' || abortController.signal.aborted) {
+      return
+    }
+    // CAS：仅 queued → running。若已被取消（CAS 失败）则直接退出，不复活任务
+    const started = applyStatusTransition(task.id, { status: 'running', progress: 0.01, error: null }, ['queued'])
+    if (!started) return
     ensureDownloadDirWritable(settings.downloadDir)
-    const musicInfo = JSON.parse(task.music_info_json || '{}')
+    const musicInfo = JSON.parse(task.music_info_json || '{}') as Record<string, unknown>
     const { url, quality } = await resolveUrl(task, task.quality || settings.defaultQuality)
-    if (cancelSet.has(task.id)) throw new Error('cancelled')
+    if (abortController.signal.aborted) throw new Error('cancelled')
     if (isLikelyPreviewUrl(url)) throw previewUrlError()
 
     const expectedDuration = expectedDurationFromMusicInfo(musicInfo)
 
     const dir = getDownloadDir(settings.downloadDir)
-    const trackNo = musicInfo.track || musicInfo.trackNo || musicInfo.tracknum || musicInfo.no
-    const base = applyNameTemplate(settings.nameTemplate, {
-      artist: task.artist,
-      title: task.title,
-      album: task.album || undefined,
-      platform: task.platform,
-      quality,
-      id: task.external_id || undefined,
-      track: trackNo,
-    })
+    const trackNo = (musicInfo.track || musicInfo.trackNo || musicInfo.tracknum || musicInfo.no) as string | number | undefined
+    const folderPrefix =
+      typeof musicInfo.__folderPrefix === 'string' ? musicInfo.__folderPrefix : null
+    const base = buildDownloadRelativeBase(
+      settings.nameTemplate,
+      {
+        artist: task.artist,
+        title: task.title,
+        album: task.album || undefined,
+        platform: task.platform,
+        quality,
+        id: task.external_id || undefined,
+        track: trackNo,
+      },
+      folderPrefix,
+    )
     const ext = guessExt(url, quality)
-    filePath = join(dir, `${base}.${ext}`)
+    filePath = joinDownloadRelative(dir, base, ext)
+    ensureParentDir(filePath)
     await downloadFile(
       url,
       filePath,
       (p, received, total) =>
-        updateTask(task.id, {
-          progress: p,
-          quality,
-          file_size: total > 0 ? total : received || null,
-        }),
-      task.id,
+        updateTask(
+          task.id,
+          {
+            progress: p,
+            quality,
+            file_size: total > 0 ? total : received || null,
+          },
+          { throttleProgress: true },
+        ),
+      abortController.signal,
       { expectedDurationSec: expectedDuration, quality },
     )
 
-    if (cancelSet.has(task.id)) throw new Error('cancelled')
+    if (abortController.signal.aborted) throw new Error('cancelled')
 
     // 按文件魔数纠正扩展名，避免「标称 flac、实为 mp3」导致元数据写入失败
     filePath = alignFileExtension(filePath, base, dir)
@@ -610,7 +1047,8 @@ async function processTask(task: DownloadTaskRow) {
     }
 
     if (lrcText && lyricMode === 'external') {
-      lyricPath = join(dir, `${base}.lrc`)
+      lyricPath = joinDownloadRelative(dir, base, 'lrc')
+      ensureParentDir(lyricPath)
       writeFileSync(lyricPath, lrcText, 'utf8')
     }
 
@@ -633,37 +1071,51 @@ async function processTask(task: DownloadTaskRow) {
     }
 
     // 取消竞态：完成后才发现已取消 → 删文件
-    if (cancelSet.has(task.id)) {
+    if (abortController.signal.aborted) {
       removeFileQuiet(filePath)
       removeFileQuiet(lyricPath)
       throw new Error('cancelled')
     }
 
-    updateTask(task.id, {
-      status: 'completed',
-      progress: 1,
-      file_path: filePath,
-      lyric_path: lyricPath,
-      quality,
-      file_size: fileSize,
-      error: null,
-    })
-  } catch (err: any) {
-    let msg = err?.message || String(err)
+    // CAS：仅 running → completed。未命中说明任务已被取消，清理本地文件并保留取消态
+    const completed = applyStatusTransition(
+      task.id,
+      {
+        status: 'completed',
+        progress: 1,
+        file_path: filePath,
+        lyric_path: lyricPath,
+        quality,
+        file_size: fileSize,
+        error: null,
+      },
+      ['running'],
+    )
+    if (!completed) {
+      removeFileQuiet(filePath)
+      removeFileQuiet(lyricPath)
+    }
+  } catch (err: unknown) {
+    const e = err as { message?: string; code?: string; name?: string }
+    let msg = e?.message || String(err)
     if (isDownloadPermissionError(err) && !/无下载目录写入权限/.test(msg)) {
       msg = `无下载目录写入权限: ${settings.downloadDir}`
-      ;(err as any).code = 'EACCES'
+      Object.assign(err as object, { code: 'EACCES' })
     }
     removeFileQuiet(filePath)
     removeFileQuiet(lyricPath)
-    if (msg === 'cancelled' || cancelSet.has(task.id)) {
-      updateTask(task.id, {
-        status: 'cancelled',
-        error: '用户取消',
-        file_path: null,
-        lyric_path: null,
-        file_size: null,
-      })
+    if (msg === 'cancelled' || abortController.signal.aborted || e?.name === 'AbortError') {
+      applyStatusTransition(
+        task.id,
+        {
+          status: 'cancelled',
+          error: '用户取消',
+          file_path: null,
+          lyric_path: null,
+          file_size: null,
+        },
+        ['queued', 'running'],
+      )
       return
     }
     const attempts = (task.attempts || 0) + 1
@@ -671,16 +1123,16 @@ async function processTask(task: DownloadTaskRow) {
     const qualityPref = task.quality || settings2.defaultQuality
     const fixedQuality = !isHighestQuality(qualityPref)
     // 试听片段：只标失败，不自动换源/重试；由用户在队列手动换源
-    const isPreview = String(err?.code) === 'PREVIEW_CLIP'
+    const isPreview = String(e?.code) === 'PREVIEW_CLIP'
     const isPerm = isDownloadPermissionError(err)
-    // 固定音质：取链失败不换源；仅网络/磁盘类可同源重试
+    // 固定音质：resolve 已轮询全部音源；失败即停并提示原因
     const retryable = isPreview || isPerm
       ? false
       : fixedQuality
-        ? isRetryableError(err) || String(err?.code) === 'HTTP_RETRY'
+        ? isRetryableError(err) || String(e?.code) === 'HTTP_RETRY'
         : isRetryableError(err) ||
-          String(err?.code) === 'HTTP_RETRY' ||
-          String(err?.code) === 'GET_URL_FAILED'
+          String(e?.code) === 'HTTP_RETRY' ||
+          String(e?.code) === 'GET_URL_FAILED'
     const alts = fixedQuality
       ? []
       : listEnabledOkSources(task.platform).filter((s) => s.id !== task.source_id)
@@ -693,30 +1145,42 @@ async function processTask(task: DownloadTaskRow) {
     })
     if (nextStatus === 'queued') {
       const next = alts.length ? alts[(attempts - 1) % alts.length] : null
-      updateTask(task.id, {
-        status: 'queued',
-        attempts,
-        source_id: next?.id || task.source_id,
-        error: `失败重试(${attempts}/${settings2.maxAttempts}): ${msg}`,
-        progress: 0,
-        file_path: null,
-        lyric_path: null,
-        file_size: null,
-      })
+      applyStatusTransition(
+        task.id,
+        {
+          status: 'queued',
+          attempts,
+          source_id: next?.id || task.source_id,
+          error: `失败重试(${attempts}/${settings2.maxAttempts}): ${msg}`,
+          progress: 0,
+          file_path: null,
+          lyric_path: null,
+          file_size: null,
+        },
+        ['running'],
+      )
       setTimeout(() => kickWorker(), 500)
     } else {
-      updateTask(task.id, {
-        status: 'failed',
-        attempts,
-        error: msg,
-        progress: 0,
-        file_path: null,
-        lyric_path: null,
-        file_size: null,
-      })
+      applyStatusTransition(
+        task.id,
+        {
+          status: 'failed',
+          attempts,
+          error: msg,
+          progress: 0,
+          file_path: null,
+          lyric_path: null,
+          file_size: null,
+        },
+        ['running'],
+      )
     }
   } finally {
-    cancelSet.delete(task.id)
+    inFlightQueueTaskIds.delete(task.id)
+    activeAbortControllers.delete(task.id)
+    activeProcessingTasks.delete(task.id)
+    lastEmitTimeByTaskId.delete(task.id)
+    lastEmitProgressByTaskId.delete(task.id)
   }
 }
 
@@ -738,50 +1202,70 @@ function alignFileExtension(filePath: string, base: string, dir: string): string
   if (!sniffed) return filePath
   const cur = filePath.includes('.') ? filePath.split('.').pop()!.toLowerCase() : ''
   if (cur === sniffed) return filePath
-  const next = join(dir, `${base}.${sniffed}`)
+  const next = joinDownloadRelative(dir, base, sniffed)
   if (next === filePath) return filePath
   try {
+    ensureParentDir(next)
     if (existsSync(next) && next !== filePath) unlinkSync(next)
     renameSync(filePath, next)
     console.warn(`[download] 扩展名已纠正: .${cur || '?'} → .${sniffed}`)
     return next
-  } catch (e: any) {
-    console.warn('[download] 扩展名纠正失败:', e?.message || e)
+  } catch (e: unknown) {
+    const err = e as { message?: string }
+    console.warn('[download] 扩展名纠正失败:', err?.message || e)
     return filePath
   }
 }
 
 export async function tickWorker() {
-  const settings = getSettings()
-  while (running < settings.concurrency) {
-    const waitMs = msUntilCanStartTask({
-      now: Date.now(),
-      lastStartedAt,
-      lastFinishedAt,
-      taskStartIntervalSec: settings.taskStartIntervalSec,
-      downloadIntervalSec: settings.downloadIntervalSec,
-    })
-    if (waitMs > 0) {
-      scheduleKickAfter(waitMs)
-      break
-    }
+  if (isTicking) return
+  isTicking = true
+  try {
+    const settings = getSettings()
+    const queue = getOrCreateDownloadQueue(settings.concurrency)
+    const availableSlots = settings.concurrency - (queue.pending + queue.size)
+    if (availableSlots <= 0) return
 
-    const next = getDb()
-      .prepare(`SELECT * FROM download_tasks WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1`)
-      .get() as DownloadTaskRow | undefined
-    if (!next) break
-    const changed = getDb()
-      .prepare(`UPDATE download_tasks SET status='running', updated_at=? WHERE id=? AND status='queued'`)
-      .run(nowIso(), next.id)
-    if (changed.changes === 0) break
-    const fresh = getTask(next.id)!
-    running += 1
-    lastStartedAt = Date.now()
-    void processTask({ ...fresh, status: 'queued' }).finally(() => {
-      running -= 1
-      lastFinishedAt = Date.now()
-      kickWorker()
-    })
+    for (let i = 0; i < availableSlots; i++) {
+      const waitMs = msUntilCanStartTask({
+        now: Date.now(),
+        lastStartedAt,
+        lastFinishedAt,
+        taskStartIntervalSec: settings.taskStartIntervalSec,
+        downloadIntervalSec: settings.downloadIntervalSec,
+      })
+      if (waitMs > 0) {
+        scheduleKickAfter(waitMs)
+        break
+      }
+
+      const placeholders = Array.from(inFlightQueueTaskIds).map(() => '?').join(',')
+      const notInClause = inFlightQueueTaskIds.size > 0 ? `AND id NOT IN (${placeholders})` : ''
+      const next = getDb()
+        .prepare(`SELECT * FROM download_tasks WHERE status = 'queued' ${notInClause} ORDER BY created_at ASC LIMIT 1`)
+        .get(...Array.from(inFlightQueueTaskIds)) as DownloadTaskRow | undefined
+      if (!next) break
+
+      inFlightQueueTaskIds.add(next.id)
+      lastStartedAt = Date.now()
+      void queue.add(async () => {
+        try {
+          await processTask(next)
+        } finally {
+          inFlightQueueTaskIds.delete(next.id)
+          lastFinishedAt = Date.now()
+          if (activeProcessingTasks.size === 0) {
+            scheduleIdleShrinkDb()
+          }
+          kickWorker()
+        }
+      })
+    }
+    if (availableSlots > 0 && activeProcessingTasks.size === 0 && (!downloadQueue || downloadQueue.pending === 0)) {
+      scheduleIdleShrinkDb()
+    }
+  } finally {
+    isTicking = false
   }
 }
 
@@ -790,6 +1274,17 @@ export function kickWorker() {
 }
 
 export function startDownloadWorker() {
+  // 服务启动或重启时，重置非活跃的孤儿 running 任务回 queued，防止重启残留导致假运行
+  try {
+    getDb()
+      .prepare(
+        `UPDATE download_tasks SET status = 'queued', progress = 0, updated_at = ? WHERE status = 'running'`,
+      )
+      .run(nowIso())
+  } catch (e) {
+    console.warn('[downloadQueue] 重置启动前 running 任务失败:', e)
+  }
+
   if (loopTimer) return
   loopTimer = setInterval(() => {
     void tickWorker()

@@ -8,9 +8,12 @@ type Settings = {
   downloadLyric: boolean
   lyricMode: 'external' | 'embedded'
   nameTemplate: string
+  albumDownloadToFolder: boolean
+  albumFolderTemplate: string
   autoFailover: boolean
   maxAttempts: number
   nameTemplateVars?: Array<{ key: string; desc: string }>
+  albumFolderTemplateVars?: Array<{ key: string; desc: string }>
   ffmpegAvailable?: boolean
 }
 
@@ -23,16 +26,48 @@ const form = reactive<Settings>({
   downloadLyric: true,
   lyricMode: 'external',
   nameTemplate: '{artist} - {title}',
+  albumDownloadToFolder: true,
+  albumFolderTemplate: '{album}',
   autoFailover: true,
   maxAttempts: 3,
 })
 const templateVars = ref<Array<{ key: string; desc: string }>>([])
+const albumFolderVars = ref<Array<{ key: string; desc: string }>>([])
 const ffmpegAvailable = ref<boolean | null>(null)
 const formError = ref('')
 const loading = ref(false)
 const loadingText = ref('加载设置中…')
 const toast = useToast()
 const route = useRoute()
+const { refresh: refreshAuth } = useAuth()
+const settingsTab = ref<'basic' | 'auth'>('basic')
+
+type AuthTokenStatus = {
+  authRequired: boolean
+  hasOverride: boolean
+  source: 'settings' | 'env'
+  runtime: 'fnos' | 'standard'
+}
+
+const authStatus = ref<AuthTokenStatus | null>(null)
+const authForm = reactive({
+  currentToken: '',
+  newToken: '',
+  confirmToken: '',
+})
+const showCurrentToken = ref(false)
+const showNewToken = ref(false)
+const showConfirmToken = ref(false)
+const authFormError = ref('')
+const {
+  currentVersion,
+  latest,
+  checking,
+  showBadge,
+  checkForUpdate,
+  openChangelog,
+  consumePendingOpen,
+} = useAppUpdate()
 const fnosBox = ref<HTMLElement | null>(null)
 const {
   status: fnosAuth,
@@ -56,6 +91,30 @@ const templatePreview = computed(() => {
     .replaceAll('{track}', '3')
 })
 
+const albumFolderPreview = computed(() => {
+  return form.albumFolderTemplate
+    .replaceAll('{album}', '叶惠美')
+    .replaceAll('{artist}', '周杰伦')
+    .replaceAll('{platform}', 'wy')
+})
+
+async function onCheckUpdate() {
+  loadingText.value = '检查更新中…'
+  loading.value = true
+  try {
+    const res = await checkForUpdate(true)
+    if (res?.hasUpdate && res.latest) {
+      openChangelog()
+    } else {
+      toast.success('当前已是最新版本')
+    }
+  } catch (e: unknown) {
+    toast.error(apiErrorMessage(e, '检查更新失败'))
+  } finally {
+    loading.value = false
+  }
+}
+
 async function load() {
   loadingText.value = '加载设置中…'
   loading.value = true
@@ -70,15 +129,67 @@ async function load() {
       downloadLyric: res.downloadLyric,
       lyricMode: res.lyricMode || 'external',
       nameTemplate: res.nameTemplate,
+      albumDownloadToFolder: res.albumDownloadToFolder ?? true,
+      albumFolderTemplate: res.albumFolderTemplate || '{album}',
       autoFailover: res.autoFailover,
       maxAttempts: res.maxAttempts,
     })
     templateVars.value = res.nameTemplateVars || []
+    albumFolderVars.value = res.albumFolderTemplateVars || []
     ffmpegAvailable.value = res.ffmpegAvailable ?? null
+    await loadAuthStatus()
     await refreshFnOsAuth({ notifyError: true })
     if (fnosAuth.value?.downloadDir) form.downloadDir = fnosAuth.value.downloadDir
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '加载设置失败'))
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadAuthStatus() {
+  try {
+    authStatus.value = await $fetch<AuthTokenStatus>('/api/auth/token')
+  } catch {
+    authStatus.value = null
+  }
+}
+
+async function saveAuthToken() {
+  authFormError.value = ''
+  if (authForm.newToken !== authForm.confirmToken) {
+    authFormError.value = '两次输入的新口令不一致'
+    toast.error(authFormError.value)
+    return
+  }
+  loadingText.value = '更新口令中…'
+  loading.value = true
+  try {
+    const res = await $fetch<{
+      ok: boolean
+      message?: string
+      warning?: string
+      authRequired: boolean
+      restartRequired?: boolean
+    }>('/api/auth/token', {
+      method: 'PUT',
+      body: {
+        currentToken: authForm.currentToken,
+        newToken: authForm.newToken,
+        confirmToken: authForm.confirmToken,
+      },
+    })
+    authForm.currentToken = ''
+    authForm.newToken = ''
+    authForm.confirmToken = ''
+    await loadAuthStatus()
+    await refreshAuth()
+    if (res.warning) toast.warning(res.warning)
+    else toast.success(res.message || '口令已更新')
+  } catch (e: unknown) {
+    const m = apiErrorMessage(e, '更新口令失败')
+    authFormError.value = m
+    toast.error(m)
   } finally {
     loading.value = false
   }
@@ -149,6 +260,8 @@ async function save() {
         downloadLyric: form.downloadLyric,
         lyricMode: form.lyricMode,
         nameTemplate: form.nameTemplate,
+        albumDownloadToFolder: form.albumDownloadToFolder,
+        albumFolderTemplate: form.albumFolderTemplate.trim() || '{album}',
         autoFailover: form.autoFailover,
         maxAttempts: form.maxAttempts,
       },
@@ -170,7 +283,11 @@ onMounted(async () => {
     void refreshFnOsAuth()
   })
   await load()
-  if (route.query.fnosAuth === '1') scrollToFnOsBox()
+  if (consumePendingOpen() && showBadge.value) openChangelog()
+  if (route.query.fnosAuth === '1') {
+    settingsTab.value = 'basic'
+    scrollToFnOsBox()
+  }
 })
 
 onUnmounted(() => {
@@ -186,7 +303,53 @@ useRegisterPageRefresh(async () => {
 <template>
   <div class="page page-settings">
     <PageLoading :show="loading" :text="loadingText" />
-    <h2>设置</h2>
+    <div class="tabs" role="tablist" aria-label="设置分类">
+      <button
+        type="button"
+        class="tab"
+        role="tab"
+        :class="{ active: settingsTab === 'basic' }"
+        :aria-selected="settingsTab === 'basic'"
+        @click="settingsTab = 'basic'"
+      >
+        基础设置
+      </button>
+      <button
+        type="button"
+        class="tab"
+        role="tab"
+        :class="{ active: settingsTab === 'auth' }"
+        :aria-selected="settingsTab === 'auth'"
+        @click="settingsTab = 'auth'"
+      >
+        访问口令
+      </button>
+    </div>
+
+    <template v-if="settingsTab === 'basic'">
+    <section class="card version-card">
+      <div class="version-row">
+        <div>
+          <p class="version-label">当前版本</p>
+          <p class="version-value">
+            <span>v{{ currentVersion }}</span>
+            <span v-if="showBadge" class="version-update-badge">有更新</span>
+          </p>
+        </div>
+        <button class="btn btn-ghost btn-sm" type="button" :disabled="checking || loading" @click="onCheckUpdate">
+          {{ checking ? '检查中…' : '检查更新' }}
+        </button>
+      </div>
+      <button
+        v-if="showBadge && latest"
+        type="button"
+        class="update-banner"
+        @click="openChangelog"
+      >
+        <span class="update-dot" aria-hidden="true" />
+        发现新版本 v{{ latest.version }}，点击查看更新说明
+      </button>
+    </section>
     <form class="card form" @submit.prevent="save">
       <label>
         <span>下载目录</span>
@@ -273,6 +436,21 @@ useRegisterPageRefresh(async () => {
         </ul>
       </label>
 
+      <label class="check">
+        <input v-model="form.albumDownloadToFolder" type="checkbox" />
+        专辑下载默认按文件夹归档
+      </label>
+      <label v-if="form.albumDownloadToFolder">
+        <span>专辑文件夹命名模板</span>
+        <input v-model="form.albumFolderTemplate" class="input" />
+        <p class="hint">预览：{{ albumFolderPreview || '（空）' }}/ · 仅作用于专辑入队，文件名仍用上方命名模板</p>
+        <ul class="var-list">
+          <li v-for="v in albumFolderVars" :key="v.key">
+            <code>{{ v.key }}</code> — {{ v.desc }}
+          </li>
+        </ul>
+      </label>
+
       <label>
         <span>失败最大尝试次数</span>
         <input v-model.number="form.maxAttempts" class="input" type="number" min="1" max="8" />
@@ -305,14 +483,229 @@ useRegisterPageRefresh(async () => {
       <p v-if="formError" class="err">{{ formError }}</p>
       <button class="btn" type="submit" :disabled="loading">保存</button>
     </form>
+    </template>
+
+    <section v-else class="card auth-card">
+      <p class="hint">
+        当前：
+        <span :class="authStatus?.authRequired ? 'warn' : 'ok-inline'">
+          {{ authStatus?.authRequired ? '已启用鉴权' : '开放模式（免登录）' }}
+        </span>
+        <template v-if="authStatus">
+          · 来源 {{ authStatus.source === 'settings' ? '应用内设置' : '环境变量 / 安装配置' }}
+          <template v-if="authStatus.runtime === 'fnos'"> · 飞牛 FPK</template>
+        </template>
+      </p>
+      <p class="hint">
+        修改后立即生效（无需重启）。优先级：应用内设置 &gt; Docker
+        <code>-e AUTH_TOKEN</code> / 飞牛安装向导。留空新口令可切回开放模式。
+      </p>
+      <form class="auth-form" @submit.prevent="saveAuthToken">
+        <label>
+          <span>当前口令{{ authStatus && !authStatus.authRequired ? '（开放模式请留空）' : '' }}</span>
+          <div class="token-wrap">
+            <input
+              v-model="authForm.currentToken"
+              class="input token-input"
+              :type="showCurrentToken ? 'text' : 'password'"
+              autocomplete="current-password"
+              placeholder="当前口令"
+            />
+            <button
+              class="token-toggle"
+              type="button"
+              :title="showCurrentToken ? '隐藏' : '显示'"
+              :aria-label="showCurrentToken ? '隐藏当前口令' : '显示当前口令'"
+              @click="showCurrentToken = !showCurrentToken"
+            >
+              <PasswordVisibilityIcon :visible="showCurrentToken" />
+            </button>
+          </div>
+        </label>
+        <label>
+          <span>新口令（可留空=开放模式）</span>
+          <div class="token-wrap">
+            <input
+              v-model="authForm.newToken"
+              class="input token-input"
+              :type="showNewToken ? 'text' : 'password'"
+              autocomplete="new-password"
+              placeholder="新口令"
+            />
+            <button
+              class="token-toggle"
+              type="button"
+              :title="showNewToken ? '隐藏' : '显示'"
+              :aria-label="showNewToken ? '隐藏新口令' : '显示新口令'"
+              @click="showNewToken = !showNewToken"
+            >
+              <PasswordVisibilityIcon :visible="showNewToken" />
+            </button>
+          </div>
+        </label>
+        <label>
+          <span>确认新口令</span>
+          <div class="token-wrap">
+            <input
+              v-model="authForm.confirmToken"
+              class="input token-input"
+              :type="showConfirmToken ? 'text' : 'password'"
+              autocomplete="new-password"
+              placeholder="再输入一次新口令"
+            />
+            <button
+              class="token-toggle"
+              type="button"
+              :title="showConfirmToken ? '隐藏' : '显示'"
+              :aria-label="showConfirmToken ? '隐藏确认口令' : '显示确认口令'"
+              @click="showConfirmToken = !showConfirmToken"
+            >
+              <PasswordVisibilityIcon :visible="showConfirmToken" />
+            </button>
+          </div>
+        </label>
+        <p v-if="authFormError" class="err">{{ authFormError }}</p>
+        <button class="btn" type="submit" :disabled="loading">更新口令</button>
+      </form>
+    </section>
   </div>
 </template>
 
 <style scoped>
+.tabs {
+  display: flex;
+  gap: 20px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+  max-width: 560px;
+}
+.tab {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 8px 2px 10px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  font-size: 14px;
+  line-height: 1.3;
+}
+.tab.active {
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.version-card {
+  display: grid;
+  gap: 12px;
+  max-width: 560px;
+  margin-bottom: 14px;
+  padding: 16px;
+}
+.version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.version-label {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.version-value {
+  margin: 4px 0 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 18px;
+  font-weight: 700;
+}
+.version-update-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+}
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.update-banner:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+.update-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+}
 .form {
   display: grid;
   gap: 14px;
   max-width: 560px;
+}
+.auth-card {
+  display: grid;
+  gap: 12px;
+  max-width: 560px;
+  padding: 16px;
+}
+.auth-form {
+  display: grid;
+  gap: 12px;
+}
+.auth-form label {
+  display: grid;
+  gap: 6px;
+}
+.token-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.token-input {
+  width: 100%;
+  padding-right: 42px;
+}
+.token-toggle {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 32px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.token-toggle:hover {
+  color: var(--text);
+  background: hsl(var(--secondary));
 }
 .form label {
   display: grid;
@@ -378,7 +771,22 @@ useRegisterPageRefresh(async () => {
 }
 
 @media (max-width: 768px) {
+  .tabs {
+    max-width: none;
+    gap: 0;
+  }
+  .tab {
+    flex: 1;
+    min-width: 0;
+    min-height: 40px;
+    padding: 10px 2px;
+    text-align: center;
+    font-size: 13px;
+  }
   .form {
+    max-width: none;
+  }
+  .auth-card {
     max-width: none;
   }
   .check {

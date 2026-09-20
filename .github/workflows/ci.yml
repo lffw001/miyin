@@ -21,12 +21,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pr-policy:
+    name: pr-policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: PR policy (binary / CHANGELOG)
+        env:
+          GITHUB_EVENT_NAME: pull_request
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: bash scripts/ci-check-pr.sh
+
   test-and-build:
     name: test-and-build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
 
@@ -34,7 +50,7 @@ jobs:
         run: corepack enable
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm

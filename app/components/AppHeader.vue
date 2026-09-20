@@ -2,8 +2,9 @@
 import { APP_NAV_LINKS, navLinkActive } from '~/utils/nav'
 
 const route = useRoute()
-const { logout, authRequired } = useAuth()
 const { activeCount, startWatching } = useDownloadEvents()
+const { showBadge: showUpdateBadge, requestOpenOnSettings } = useAppUpdate()
+const { logout, authRequired } = useAuth()
 const { mode, cycle } = useTheme()
 const { canRefresh, busy: refreshBusy, refreshCurrentPage } = usePageRefreshAction()
 const toast = useToast()
@@ -17,6 +18,10 @@ const themeTitle = computed(() => {
 async function onLogout() {
   await logout()
   toast.info('已退出登录')
+}
+
+function onNavClick(to: string) {
+  if (to === '/settings' && showUpdateBadge.value) requestOpenOnSettings()
 }
 
 onMounted(() => startWatching())
@@ -39,9 +44,11 @@ onMounted(() => startWatching())
         :to="l.to"
         class="nav-link"
         :class="{ active: navLinkActive(route.path, l.to) }"
+        @click="onNavClick(l.to)"
       >
         {{ l.label }}
         <span v-if="l.badge && activeCount > 0" class="badge">{{ activeCount > 99 ? '99+' : activeCount }}</span>
+        <span v-if="l.to === '/settings' && showUpdateBadge" class="badge update-badge" aria-hidden="true" />
       </NuxtLink>
     </nav>
     <div class="header-actions">
@@ -85,7 +92,9 @@ onMounted(() => startWatching())
           <path d="M8 20h8M12 16v4" />
         </svg>
       </button>
-      <button v-if="authRequired" class="btn btn-ghost btn-sm logout-btn" type="button" @click="onLogout">
+      <AppHelpMenu />
+      <button
+        v-if="authRequired" class="btn btn-ghost btn-sm logout-btn" type="button" @click="onLogout">
         退出
       </button>
     </div>
@@ -157,6 +166,17 @@ onMounted(() => startWatching())
   line-height: 18px;
   text-align: center;
 }
+.update-badge {
+  min-width: 8px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border-radius: 50%;
+  line-height: 8px;
+  position: absolute;
+  top: 4px;
+  right: 2px;
+}
 .header-actions {
   display: flex;
   align-items: center;
@@ -202,7 +222,6 @@ onMounted(() => startWatching())
   .header {
     gap: 8px;
     padding: 8px 12px;
-    padding-top: calc(8px + env(safe-area-inset-top, 0px));
   }
   .desktop-nav {
     display: none;

@@ -1,6 +1,6 @@
 {
   "name": "miyin",
-  "version": "0.4.2",
+  "version": "0.5.2",
   "type": "module",
   "private": true,
   "scripts": {
@@ -10,15 +10,20 @@
     "preview": "nuxt preview --port 18980",
     "postinstall": "nuxt prepare",
     "test": "vitest run",
+    "changelog:add": "bash scripts/changelog-entry.sh",
+    "download:fnpack": "node scripts/download-fnpack.mjs",
     "build:fpk": "bash packaging/fnos/scripts/build-fpk.sh",
     "release": "bash scripts/release.sh"
   },
   "dependencies": {
-    "@tanstack/vue-virtual": "^3.13.35",
+    "@tanstack/vue-virtual": "^3.13.36",
     "@trimjs/web-app": "^0.4.2",
+    "@vueuse/core": "14.4.0",
+    "@vueuse/nuxt": "^14.4.0",
     "better-sqlite3": "^13.0.3",
     "fflate": "^0.8.3",
     "nuxt": "^4.5.1",
+    "p-queue": "^9.3.3",
     "qrc-decoder": "1.0.2",
     "vue": "^3.5.40",
     "vue-router": "^5.2.0",
@@ -26,7 +31,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "packageManager": "pnpm@10.28.0",
   "engines": {

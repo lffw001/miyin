@@ -7,9 +7,64 @@ import { request as httpRequest } from 'node:https'
 import { request as httpRequestPlain } from 'node:http'
 import { URL } from 'node:url'
 import { promisify } from 'node:util'
+import { inspect } from 'node:util'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import type { SourceLogLevel } from '#shared/sourceBatchProgress'
+import {
+  mergeSourceUpdateInfo,
+  parseSourceUpdateHint,
+  type SourceUpdateInfo,
+} from '#shared/sourceUpdate'
 
 const inflateAsync = promisify(zlibInflate)
 const deflateAsync = promisify(zlibDeflate)
+
+export type SourceLogSink = (entry: { level: SourceLogLevel; message: string }) => void
+
+const sourceLogAls = new AsyncLocalStorage<SourceLogSink>()
+
+function formatSourceLogArgs(args: unknown[]): string {
+  return args
+    .map((a) => {
+      if (typeof a === 'string') return a
+      if (a instanceof Error) return a.stack || a.message
+      if (typeof a === 'undefined') return 'undefined'
+      try {
+        return inspect(a, {
+          depth: 4,
+          breakLength: 100,
+          maxStringLength: 4000,
+          colors: false,
+        })
+      } catch {
+        return String(a)
+      }
+    })
+    .join(' ')
+}
+
+/** 终端 + 可选前端日志槽（检测/导入探针期间） */
+export function emitSourceLog(level: SourceLogLevel, ...args: unknown[]) {
+  const message = formatSourceLogArgs(args)
+  const printer =
+    level === 'error'
+      ? console.error
+      : level === 'warn'
+        ? console.warn
+        : level === 'info'
+          ? console.info
+          : console.log
+  printer('[source]', ...args)
+  try {
+    sourceLogAls.getStore()?.({ level, message })
+  } catch {
+    /* ignore sink errors */
+  }
+}
+
+export function runWithSourceLogSink<T>(sink: SourceLogSink, fn: () => Promise<T>): Promise<T> {
+  return sourceLogAls.run(sink, fn)
+}
 
 export type LxSourceHandle = {
   platforms: string[]
@@ -17,6 +72,10 @@ export type LxSourceHandle = {
   getMusicUrl: (platform: string, musicInfo: Record<string, any>, quality: string) => Promise<string>
   dispose: () => void
   sourceKey: string
+  /** 脚本 checkUpdate / updateAlert 推送的提示（如版本过旧） */
+  updateAlerts: string[]
+  /** 结构化更新信息（版本 / 下载或说明链接） */
+  updateInfo: SourceUpdateInfo | null
 }
 
 const LOAD_TIMEOUT_MS = Number(process.env.MIYIN_SOURCE_LOAD_TIMEOUT_MS || 5000)
@@ -102,27 +161,30 @@ export function isBenignSourceScriptError(reason: unknown): boolean {
   return /Cannot read propert(y|ies) of (undefined|null)/i.test(msg)
 }
 
-type RejectionBucket = { errors: Error[] }
+type RejectionBucket = { errors: Error[]; active: boolean }
 
 let rejectionGuardDepth = 0
 let rejectionGuardHandler: ((reason: unknown, promise: Promise<unknown>) => void) | null = null
-let rejectionGuardSaved: Array<(...args: any[]) => void> = []
+let rejectionGuardSaved: Array<(...args: unknown[]) => void> = []
 let rejectionGuardHoldTimer: NodeJS.Timeout | null = null
-const rejectionBuckets = new Set<RejectionBucket>()
+const activeRejectionBuckets = new Set<RejectionBucket>()
 
 function ensureRejectionGuard() {
   if (rejectionGuardHandler) return
-  rejectionGuardSaved = process.listeners('unhandledRejection').slice() as Array<(...args: any[]) => void>
+  rejectionGuardSaved = process.listeners('unhandledRejection').slice() as Array<(...args: unknown[]) => void>
   for (const l of rejectionGuardSaved) {
     process.removeListener('unhandledRejection', l)
   }
   rejectionGuardHandler = (reason: unknown, promise: Promise<unknown>) => {
     if (isBenignSourceScriptError(reason)) {
       const e = reason instanceof Error ? reason : new Error(String(reason))
-      for (const b of rejectionBuckets) b.errors.push(e)
+      for (const b of activeRejectionBuckets) {
+        if (b.active && b.errors.length < 50) {
+          b.errors.push(e)
+        }
+      }
       const kind = isBenignSourceNetworkError(reason) ? 'network error' : 'script error'
-      console.warn(`[source] ${kind}:`, e.message)
-      // 已临时接管 unhandledRejection 监听，不再事后 catch（避免 PromiseRejectionHandledWarning）
+      emitSourceLog('warn', `${kind}:`, e.message)
       void promise
       return
     }
@@ -147,6 +209,7 @@ function teardownRejectionGuard() {
     }
   }
   rejectionGuardSaved = []
+  activeRejectionBuckets.clear()
 }
 
 /**
@@ -157,10 +220,10 @@ export function acquireSourceRejectionGuard(): {
   errors: Error[]
   release: () => void
 } {
-  const bucket: RejectionBucket = { errors: [] }
+  const bucket: RejectionBucket = { errors: [], active: true }
   ensureRejectionGuard()
   rejectionGuardDepth += 1
-  rejectionBuckets.add(bucket)
+  activeRejectionBuckets.add(bucket)
   if (rejectionGuardHoldTimer) {
     clearTimeout(rejectionGuardHoldTimer)
     rejectionGuardHoldTimer = null
@@ -173,7 +236,8 @@ export function acquireSourceRejectionGuard(): {
     release() {
       if (released) return
       released = true
-      rejectionBuckets.delete(bucket)
+      bucket.active = false
+      activeRejectionBuckets.delete(bucket)
       rejectionGuardDepth = Math.max(0, rejectionGuardDepth - 1)
       if (rejectionGuardDepth === 0) {
         teardownRejectionGuard()
@@ -200,7 +264,7 @@ export function resetSourceRejectionGuardForTests() {
     rejectionGuardHoldTimer = null
   }
   rejectionGuardDepth = 0
-  rejectionBuckets.clear()
+  activeRejectionBuckets.clear()
   teardownRejectionGuard()
 }
 
@@ -225,7 +289,7 @@ function nodeHttpRequest(
     try {
       cb(err, resp)
     } catch (e) {
-      console.error('[source] request callback error', e)
+      emitSourceLog('error', 'request callback error', e)
     }
   }
   try {
@@ -437,6 +501,8 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
   }
 
   const handlers: Array<(payload: any) => any> = []
+  const updateAlerts: string[] = []
+  let updateInfo: SourceUpdateInfo | null = null
   let platforms: string[] = []
   let qualityMap: Record<string, string[]> = {}
   let disposed = false
@@ -446,6 +512,15 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
     resolveInit = resolve
   })
   const timers = new Set<NodeJS.Timeout>()
+
+  const ingestUpdateHints = (...args: unknown[]) => {
+    for (const arg of args) {
+      updateInfo = mergeSourceUpdateInfo(updateInfo, parseSourceUpdateHint(arg))
+    }
+    if (args.length > 1) {
+      updateInfo = mergeSourceUpdateInfo(updateInfo, parseSourceUpdateHint(formatSourceLogArgs(args)))
+    }
+  }
 
   const EVENT_NAMES = {
     request: 'request',
@@ -493,7 +568,9 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
   const failLoad = (message: string): never => {
     for (const t of timers) safeClear(t)
     recordFailure(localPath)
-    throw new Error(message)
+    const err = new Error(message) as Error & { updateInfo?: SourceUpdateInfo | null }
+    err.updateInfo = updateInfo
+    throw err
   }
 
   const parentRequire = createRequire(import.meta.url)
@@ -529,9 +606,14 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
         }
         resolveInit?.()
       }
-      // updateAlert：仅记录，不中断加载
+      // updateAlert：记录供检测展示（如脚本版本过旧）
       if (name === EVENT_NAMES.updateAlert) {
-        console.warn('[source] updateAlert', payload?.log || payload)
+        ingestUpdateHints(payload)
+        const text = String(payload?.log || payload?.message || payload || '').trim()
+        if (text) updateAlerts.push(text)
+        else if (updateInfo?.description) updateAlerts.push(updateInfo.description)
+        else if (updateInfo?.version) updateAlerts.push(`发现新版本 v${updateInfo.version}`)
+        emitSourceLog('warn', 'updateAlert', text || payload)
       }
       return Promise.resolve()
     },
@@ -539,10 +621,22 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
 
   const sandbox: Record<string, any> = {
     console: {
-      log: (...a: any[]) => console.log('[source]', ...a),
-      warn: (...a: any[]) => console.warn('[source]', ...a),
-      error: (...a: any[]) => console.error('[source]', ...a),
-      info: (...a: any[]) => console.info('[source]', ...a),
+      log: (...a: any[]) => {
+        ingestUpdateHints(...a)
+        emitSourceLog('log', ...a)
+      },
+      warn: (...a: any[]) => {
+        ingestUpdateHints(...a)
+        emitSourceLog('warn', ...a)
+      },
+      error: (...a: any[]) => {
+        ingestUpdateHints(...a)
+        emitSourceLog('error', ...a)
+      },
+      info: (...a: any[]) => {
+        ingestUpdateHints(...a)
+        emitSourceLog('info', ...a)
+      },
       group: () => {},
       groupEnd: () => {},
     },
@@ -571,7 +665,14 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
     rejectionGuard.release()
     recordFailure(localPath)
     if (String(err?.message || err).includes('Script execution timed out')) {
-      throw new Error('音源脚本初始化超时（疑似死循环）')
+      const timeoutErr = new Error('音源脚本初始化超时（疑似死循环）') as Error & {
+        updateInfo?: SourceUpdateInfo | null
+      }
+      timeoutErr.updateInfo = updateInfo
+      throw timeoutErr
+    }
+    if (err && typeof err === 'object') {
+      ;(err as Error & { updateInfo?: SourceUpdateInfo | null }).updateInfo = updateInfo
     }
     throw err
   }
@@ -632,6 +733,10 @@ export async function loadLxSource(localPath: string, opts?: { bypassCache?: boo
     sourceKey: key,
     platforms,
     qualityMap,
+    updateAlerts,
+    get updateInfo() {
+      return updateInfo
+    },
     getMusicUrl,
     dispose() {
       disposed = true

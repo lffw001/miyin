@@ -1,5 +1,10 @@
 <script setup lang="ts">
 import type { ImportConflict } from '~/components/ImportConflictDialog.vue'
+import {
+  isDirectSourceScriptUrl,
+  sourceUpdateCanOneClick,
+  type SourceUpdateInfo,
+} from '#shared/sourceUpdate'
 
 type Source = {
   id: string
@@ -10,6 +15,7 @@ type Source = {
   platforms: string
   last_checked_at: string | null
   last_error: string | null
+  update_info_json?: string | null
 }
 
 const items = ref<Source[]>([])
@@ -21,11 +27,89 @@ const importText = ref('')
 const loading = ref(false)
 const loadingText = ref('加载中…')
 const pageLoading = ref(true)
+const batchLogs = ref<Array<{ level?: string; message: string; name?: string }>>([])
+const batchCompleted = ref(false)
+const batchCompletedText = ref('处理完成')
+let batchConfirmResolve: (() => void) | null = null
+const batchAbortRef = ref<AbortController | null>(null)
 const selected = ref<Set<string>>(new Set())
 const moreOpen = ref(false)
 const rowOpsId = ref<string | null>(null)
 const toast = useToast()
 
+function resetBatchUi() {
+  batchLogs.value = []
+  batchCompleted.value = false
+  batchCompletedText.value = '处理完成'
+  batchConfirmResolve = null
+}
+
+function beginBatchWithLogs(text: string) {
+  resetBatchUi()
+  loadingText.value = text
+  loading.value = true
+}
+
+function appendBatchLog(event: { level?: string; message: string; name?: string }) {
+  batchLogs.value.push({
+    level: event.level,
+    message: event.message,
+    name: event.name,
+  })
+}
+
+function waitBatchConfirm(completedText: string) {
+  batchCompletedText.value = completedText
+  batchCompleted.value = true
+  return new Promise<void>((resolve) => {
+    batchConfirmResolve = resolve
+  })
+}
+
+function onBatchConfirm() {
+  batchConfirmResolve?.()
+  batchConfirmResolve = null
+  batchCompleted.value = false
+  batchLogs.value = []
+  loading.value = false
+}
+
+function cancelBatchOperation() {
+  batchAbortRef.value?.abort()
+}
+
+function isBatchRunning() {
+  return loading.value && !batchCompleted.value
+}
+
+async function runSourceBatchJob(
+  startText: string,
+  run: (signal: AbortSignal) => Promise<void>,
+) {
+  beginBatchWithLogs(startText)
+  const ac = new AbortController()
+  batchAbortRef.value = ac
+  try {
+    await run(ac.signal)
+  } catch (e: unknown) {
+    if (isAbortError(e)) {
+      toast.info('已停止；已完成项已保留')
+      resetBatchUi()
+      loading.value = false
+      return false
+    }
+    throw e
+  } finally {
+    if (batchAbortRef.value === ac) batchAbortRef.value = null
+  }
+  return true
+}
+
+const selectedCount = computed(() => selected.value.size)
+const allSelected = computed(() => items.value.length > 0 && selected.value.size === items.value.length)
+const showPageLoading = computed(
+  () => pageLoading.value || loading.value || batchCompleted.value,
+)
 const showConflict = ref(false)
 const conflictLoading = ref(false)
 const conflictPreview = ref<{
@@ -47,10 +131,6 @@ const conflictDescription = computed(() => {
   }
   return `完整包中有 ${preview.conflictCount} 个与现有音源冲突（同 ID 或同 URL），另有 ${preview.newCount} 个可直接新增。请选择对冲突项的处理方式：`
 })
-
-const selectedCount = computed(() => selected.value.size)
-const allSelected = computed(() => items.value.length > 0 && selected.value.size === items.value.length)
-const showPageLoading = computed(() => pageLoading.value || loading.value)
 
 async function load(opts?: { silent?: boolean }) {
   if (!opts?.silent) {
@@ -98,68 +178,84 @@ function openEdit(s: Source) {
 }
 
 async function doImport() {
-  loadingText.value = '当前进度：准备导入…'
-  loading.value = true
   try {
-    const done = await fetchSourceBatchNdjson(
-      '/api/sources/import',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: importText.value, stream: true }),
-      },
-      (text) => {
-        loadingText.value = text
-      },
-    )
-    const ok = done.imported ?? 0
-    const skipped = done.skipped ?? 0
-    const renamed = done.renamed ?? 0
-    const failed = done.failed ?? 0
-    const text =
-      `导入完成：成功 ${ok}/${done.total}` +
-      (skipped ? `，跳过 ${skipped}` : '') +
-      (renamed ? `，改名 ${renamed}` : '') +
-      (failed ? `，失败 ${failed}` : '') +
-      (done.timedOut ? '（整批超时）' : '')
-    if (ok > 0) toast.success(text)
-    else toast.warning(text)
-    showImport.value = false
-    importText.value = ''
-    await load({ silent: true })
+    const ok = await runSourceBatchJob('当前进度：准备导入…', async (signal) => {
+      const done = await fetchSourceBatchNdjson(
+        '/api/sources/import',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: importText.value, stream: true }),
+          signal,
+        },
+        {
+          onProgress: (text) => {
+            loadingText.value = text
+          },
+          onLog: appendBatchLog,
+        },
+      )
+      const imported = done.imported ?? 0
+      const skipped = done.skipped ?? 0
+      const renamed = done.renamed ?? 0
+      const failed = done.failed ?? 0
+      const text =
+        (done.cancelled ? '已停止：' : '导入完成：') +
+        `成功 ${imported}/${done.total}` +
+        (skipped ? `，跳过 ${skipped}` : '') +
+        (renamed ? `，改名 ${renamed}` : '') +
+        (failed ? `，失败 ${failed}` : '') +
+        (done.timedOut ? '（整批超时）' : '')
+      if (imported > 0) toast.success(text)
+      else toast.warning(text)
+      showImport.value = false
+      importText.value = ''
+      await load({ silent: true })
+      await waitBatchConfirm(text)
+    })
+    if (!ok) return
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '导入失败'))
-  } finally {
     loading.value = false
+    resetBatchUi()
   }
 }
 
 async function checkAll() {
   moreOpen.value = false
-  loadingText.value = '当前进度：准备检测…'
-  loading.value = true
   try {
-    const done = await fetchSourceBatchNdjson(
-      '/api/sources/check',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stream: true }),
-      },
-      (text) => {
-        loadingText.value = text
-      },
-    )
-    await load({ silent: true })
-    const summary = summarizeSourceCheck(done.items || [])
-    const msg = done.timedOut ? `${summary.message}（整批超时）` : summary.message
-    if (summary.level === 'success') toast.success(msg)
-    else if (summary.level === 'warning') toast.warning(msg)
-    else toast.error(msg)
+    const ok = await runSourceBatchJob('当前进度：准备检测…', async (signal) => {
+      const done = await fetchSourceBatchNdjson(
+        '/api/sources/check',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stream: true }),
+          signal,
+        },
+        {
+          onProgress: (text) => {
+            loadingText.value = text
+          },
+          onLog: appendBatchLog,
+        },
+      )
+      await load({ silent: true })
+      const summary = summarizeSourceCheck(done.items || [])
+      let msg = done.timedOut ? `${summary.message}（整批超时）` : summary.message
+      if (done.cancelled) msg = `已停止：${msg}`
+      if (summary.level === 'success') toast.success(msg)
+      else if (summary.level === 'warning') toast.warning(msg)
+      else toast.error(msg)
+      await waitBatchConfirm(msg)
+    })
+    if (!ok) {
+      await load({ silent: true })
+    }
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '检测失败'))
-  } finally {
     loading.value = false
+    resetBatchUi()
   }
 }
 
@@ -199,6 +295,33 @@ async function toggle(s: Source) {
     toast.success(s.enabled ? `已禁用「${s.name}」` : `已启用「${s.name}」`)
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '更新失败'))
+  }
+}
+
+const enabledDeadCount = computed(
+  () => items.value.filter((s) => s.status === 'dead' && s.enabled === 1).length,
+)
+
+async function disableAllDead() {
+  moreOpen.value = false
+  const n = enabledDeadCount.value
+  if (!n) {
+    toast.info('当前没有仍启用的异常音源')
+    return
+  }
+  if (!confirm(`确认停用 ${n} 个异常音源？不会删除记录，仅停止参与取链。`)) return
+  loadingText.value = '停用异常音源中…'
+  loading.value = true
+  try {
+    const res = await $fetch<{ disabled: number }>('/api/sources/disable-dead', { method: 'POST' })
+    await load({ silent: true })
+    const count = res.disabled ?? 0
+    if (count > 0) toast.success(`已停用 ${count} 个异常音源`)
+    else toast.info('当前没有仍启用的异常音源')
+  } catch (e: unknown) {
+    toast.error(apiErrorMessage(e, '停用失败'))
+  } finally {
+    loading.value = false
   }
 }
 
@@ -361,37 +484,47 @@ async function applyBundle(onConflict: 'overwrite' | 'skip') {
   const file = pendingBundleFile.value
   if (!file) return
   conflictLoading.value = true
-  loadingText.value = '当前进度：准备导入完整包…'
-  loading.value = true
   try {
-    const fd = new FormData()
-    fd.append('file', file, file.name)
-    fd.append('onConflict', onConflict)
-    fd.append('stream', 'true')
-    const done = await fetchSourceBatchNdjson(
-      '/api/sources/import-bundle',
-      { method: 'POST', body: fd },
-      (text) => {
-        loadingText.value = text
-      },
-    )
-    showConflict.value = false
-    pendingBundleFile.value = null
-    conflictPreview.value = null
-    const text =
-      `导入完成：新增 ${done.imported ?? 0}` +
-      (done.overwritten ? `，覆盖 ${done.overwritten}` : '') +
-      (done.skipped ? `，跳过 ${done.skipped}` : '') +
-      (done.failed ? `，失败 ${done.failed}` : '') +
-      (done.timedOut ? '（整批超时）' : '')
-    if ((done.imported ?? 0) + (done.overwritten ?? 0) > 0) toast.success(text)
-    else toast.warning(text)
-    await load({ silent: true })
+    const ok = await runSourceBatchJob('当前进度：准备导入完整包…', async (signal) => {
+      const fd = new FormData()
+      fd.append('file', file, file.name)
+      fd.append('onConflict', onConflict)
+      fd.append('stream', 'true')
+      const done = await fetchSourceBatchNdjson(
+        '/api/sources/import-bundle',
+        { method: 'POST', body: fd, signal },
+        {
+          onProgress: (text) => {
+            loadingText.value = text
+          },
+          onLog: appendBatchLog,
+        },
+      )
+      showConflict.value = false
+      pendingBundleFile.value = null
+      conflictPreview.value = null
+      const text =
+        (done.cancelled ? '已停止：' : '导入完成：') +
+        `新增 ${done.imported ?? 0}` +
+        (done.overwritten ? `，覆盖 ${done.overwritten}` : '') +
+        (done.skipped ? `，跳过 ${done.skipped}` : '') +
+        (done.failed ? `，失败 ${done.failed}` : '') +
+        (done.timedOut ? '（整批超时）' : '')
+      if ((done.imported ?? 0) + (done.overwritten ?? 0) > 0) toast.success(text)
+      else toast.warning(text)
+      await load({ silent: true })
+      conflictLoading.value = false
+      await waitBatchConfirm(text)
+    })
+    if (!ok) {
+      conflictLoading.value = false
+      await load({ silent: true })
+    }
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '导入完整包失败'))
-  } finally {
     conflictLoading.value = false
     loading.value = false
+    resetBatchUi()
   }
 }
 
@@ -399,37 +532,47 @@ async function applyDirFiles(onConflict: 'overwrite' | 'skip') {
   const files = pendingDirFiles.value
   if (!files.length) return
   conflictLoading.value = true
-  loadingText.value = '当前进度：准备导入目录…'
-  loading.value = true
   try {
-    const fd = new FormData()
-    for (const f of files) fd.append('files', f, f.name)
-    fd.append('onConflict', onConflict)
-    fd.append('stream', 'true')
-    const done = await fetchSourceBatchNdjson(
-      '/api/sources/upload',
-      { method: 'POST', body: fd },
-      (text) => {
-        loadingText.value = text
-      },
-    )
-    showConflict.value = false
-    pendingDirFiles.value = []
-    conflictPreview.value = null
-    const text =
-      `导入完成：新增 ${done.imported ?? 0}` +
-      (done.overwritten ? `，覆盖 ${done.overwritten}` : '') +
-      (done.skipped ? `，跳过 ${done.skipped}` : '') +
-      (done.failed ? `，失败 ${done.failed}` : '') +
-      (done.timedOut ? '（整批超时）' : '')
-    if ((done.imported ?? 0) + (done.overwritten ?? 0) > 0) toast.success(text)
-    else toast.warning(text)
-    await load({ silent: true })
+    const ok = await runSourceBatchJob('当前进度：准备导入目录…', async (signal) => {
+      const fd = new FormData()
+      for (const f of files) fd.append('files', f, f.name)
+      fd.append('onConflict', onConflict)
+      fd.append('stream', 'true')
+      const done = await fetchSourceBatchNdjson(
+        '/api/sources/upload',
+        { method: 'POST', body: fd, signal },
+        {
+          onProgress: (text) => {
+            loadingText.value = text
+          },
+          onLog: appendBatchLog,
+        },
+      )
+      showConflict.value = false
+      pendingDirFiles.value = []
+      conflictPreview.value = null
+      const text =
+        (done.cancelled ? '已停止：' : '导入完成：') +
+        `新增 ${done.imported ?? 0}` +
+        (done.overwritten ? `，覆盖 ${done.overwritten}` : '') +
+        (done.skipped ? `，跳过 ${done.skipped}` : '') +
+        (done.failed ? `，失败 ${done.failed}` : '') +
+        (done.timedOut ? '（整批超时）' : '')
+      if ((done.imported ?? 0) + (done.overwritten ?? 0) > 0) toast.success(text)
+      else toast.warning(text)
+      await load({ silent: true })
+      conflictLoading.value = false
+      await waitBatchConfirm(text)
+    })
+    if (!ok) {
+      conflictLoading.value = false
+      await load({ silent: true })
+    }
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '导入目录失败'))
-  } finally {
     conflictLoading.value = false
     loading.value = false
+    resetBatchUi()
   }
 }
 
@@ -462,6 +605,61 @@ function displayUrl(s: Source) {
   return s.url
 }
 
+function parseUpdateInfo(s: Source): SourceUpdateInfo | null {
+  if (!s.update_info_json) return null
+  try {
+    const obj = JSON.parse(s.update_info_json) as SourceUpdateInfo
+    if (!obj || typeof obj !== 'object') return null
+    if (!obj.version && !obj.updateUrl && !obj.description && !obj.message) return null
+    return obj
+  } catch {
+    return null
+  }
+}
+
+function updateTip(s: Source): string {
+  const info = parseUpdateInfo(s)
+  if (!info) return ''
+  const ver = info.version ? ` v${info.version}` : ''
+  const desc = info.description || info.message || ''
+  return desc ? `有更新${ver}：${desc}` : `有更新${ver}`
+}
+
+function canOneClickUpdate(s: Source): boolean {
+  return sourceUpdateCanOneClick(parseUpdateInfo(s))
+}
+
+function openUpdateDocs(s: Source) {
+  const url = parseUpdateInfo(s)?.updateUrl
+  if (!url) {
+    toast.warning('没有可用的更新说明链接')
+    return
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
+}
+
+async function oneClickUpdate(s: Source) {
+  const info = parseUpdateInfo(s)
+  if (!info?.updateUrl || !isDirectSourceScriptUrl(info.updateUrl)) {
+    openUpdateDocs(s)
+    return
+  }
+  if (!confirm(`将从更新链接下载并覆盖「${s.name}」的本地脚本，可能冲掉手改 Key。是否继续？`)) {
+    return
+  }
+  loadingText.value = `正在更新「${s.name}」…`
+  loading.value = true
+  try {
+    await $fetch(`/api/sources/${s.id}/apply-update`, { method: 'POST' })
+    await load({ silent: true })
+    toast.success(`「${s.name}」已按更新链接覆盖并重新检测`)
+  } catch (e: unknown) {
+    toast.error(apiErrorMessage(e, '一键更新失败'))
+  } finally {
+    loading.value = false
+  }
+}
+
 function onDocClick(e: MouseEvent) {
   const t = e.target as HTMLElement | null
   if (!t?.closest?.('.more-wrap')) {
@@ -483,17 +681,32 @@ function toggleRowOps(id: string) {
   rowOpsId.value = rowOpsId.value === id ? null : id
 }
 
-function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
+function runRowOp(
+  s: Source,
+  action: 'toggle' | 'edit' | 'remove' | 'oneClick' | 'openDocs',
+) {
   rowOpsId.value = null
   if (action === 'toggle') void toggle(s)
   else if (action === 'edit') openEdit(s)
-  else void remove(s)
+  else if (action === 'remove') void remove(s)
+  else if (action === 'oneClick') void oneClickUpdate(s)
+  else openUpdateDocs(s)
 }
 </script>
 
 <template>
   <div class="page page-sources">
-    <PageLoading :show="showPageLoading" :text="loadingText" />
+    <PageLoading
+      :show="showPageLoading"
+      :text="loadingText"
+      :logs="batchLogs"
+      :completed="batchCompleted"
+      :completed-text="batchCompletedText"
+      :cancelable="isBatchRunning()"
+      cancel-text="立即停止"
+      @confirm="onBatchConfirm"
+      @cancel="cancelBatchOperation"
+    />
     <div class="toolbar">
       <div class="title">
         <h2>音源管理</h2>
@@ -530,6 +743,14 @@ function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
             <hr />
             <button type="button" role="menuitem" :disabled="loading" @click="checkAll">
               检测全部
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              :disabled="loading || !enabledDeadCount"
+              @click="disableAllDead"
+            >
+              停用所有异常{{ enabledDeadCount ? `（${enabledDeadCount}）` : '' }}
             </button>
             <button type="button" role="menuitem" @click="cleanup">清理失效</button>
           </div>
@@ -579,6 +800,38 @@ function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
             <td>
               <strong>{{ s.name }}</strong>
               <div class="muted url">{{ displayUrl(s) }}</div>
+              <div
+                v-if="parseUpdateInfo(s)"
+                class="update-tip"
+                role="button"
+                tabindex="0"
+                :aria-label="
+                  canOneClickUpdate(s) ? '有更新，点击一键更新' : '有更新，点击查看更新说明'
+                "
+              >
+                <div class="update-tip-text">
+                  <span class="badge badge-update">有更新</span>
+                  {{ updateTip(s) }}
+                </div>
+                <div class="update-tip-actions">
+                  <button
+                    v-if="canOneClickUpdate(s)"
+                    class="btn btn-ghost update-tip-btn"
+                    type="button"
+                    @click.stop="oneClickUpdate(s)"
+                  >
+                    一键更新
+                  </button>
+                  <button
+                    v-if="parseUpdateInfo(s)?.updateUrl"
+                    class="btn btn-ghost update-tip-btn"
+                    type="button"
+                    @click.stop="openUpdateDocs(s)"
+                  >
+                    {{ canOneClickUpdate(s) ? '打开说明' : '打开更新说明' }}
+                  </button>
+                </div>
+              </div>
               <div v-if="s.last_error" class="err">{{ s.last_error }}</div>
             </td>
             <td>
@@ -596,6 +849,24 @@ function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
             <td class="muted">{{ formatDate(s.last_checked_at) }}</td>
             <td class="ops">
               <div class="ops-desktop">
+                <template v-if="parseUpdateInfo(s)">
+                  <button
+                    v-if="canOneClickUpdate(s)"
+                    class="btn btn-ghost"
+                    type="button"
+                    @click="oneClickUpdate(s)"
+                  >
+                    一键更新
+                  </button>
+                  <button
+                    v-if="parseUpdateInfo(s)?.updateUrl"
+                    class="btn btn-ghost"
+                    type="button"
+                    @click="openUpdateDocs(s)"
+                  >
+                    {{ canOneClickUpdate(s) ? '打开说明' : '打开更新说明' }}
+                  </button>
+                </template>
                 <button class="btn btn-ghost" type="button" @click="toggle(s)">
                   {{ s.enabled ? '停用' : '启用' }}
                 </button>
@@ -613,6 +884,22 @@ function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
                   ···
                 </button>
                 <div v-if="rowOpsId === s.id" class="more-panel" role="menu" @click.stop>
+                  <button
+                    v-if="canOneClickUpdate(s)"
+                    type="button"
+                    role="menuitem"
+                    @click="runRowOp(s, 'oneClick')"
+                  >
+                    一键更新
+                  </button>
+                  <button
+                    v-if="parseUpdateInfo(s)?.updateUrl"
+                    type="button"
+                    role="menuitem"
+                    @click="runRowOp(s, 'openDocs')"
+                  >
+                    {{ canOneClickUpdate(s) ? '打开说明' : '打开更新说明' }}
+                  </button>
                   <button type="button" role="menuitem" @click="runRowOp(s, 'toggle')">
                     {{ s.enabled ? '停用' : '启用' }}
                   </button>
@@ -776,8 +1063,43 @@ function runRowOp(s: Source, action: 'toggle' | 'edit' | 'remove') {
   font-weight: 700;
 }
 .err {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 280px;
   color: var(--danger);
   font-size: 12px;
+}
+.update-tip {
+  margin-top: 6px;
+  max-width: 360px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--accent);
+  outline: none;
+}
+
+.update-tip-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.update-tip-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.update-tip-btn {
+  min-height: 28px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+.badge-update {
+  margin-right: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid color-mix(in oklab, var(--accent) 35%, transparent);
 }
 .empty {
   text-align: center;

@@ -1,11 +1,12 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import PQueue from 'p-queue'
 import { PLAYLIST_PLATFORM_ORDER, platformLabel, platformListText } from '#shared/platforms'
 import { request as httpsRequest } from 'node:https'
 import { request as httpRequestPlain } from 'node:http'
 import { URL } from 'node:url'
 import { searchPlatform } from './platformSearch'
 import { matchTrack } from './trackMatcher'
-import { enqueueDownload } from './downloadQueue'
+import { enqueueDownload, batchEnqueueDownload, applyFolderTemplate } from './downloadQueue'
 import { getSettings } from './settingsService'
 import { assertDownloadDirWritable } from '../utils/downloadDir'
 
@@ -34,6 +35,10 @@ const UA =
 /** 移动端 UA：wy PC 端 playlist/detail 常只返回少量 tracks，完整列表在 trackIds */
 const WY_MOBILE_UA =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 CloudMusic/8.9.10'
+
+/** 酷狗 m 站 gcid 页在桌面 UA 下常 302 到 www 空壳；移动 UA 可直接拿到内嵌 specialid */
+const KG_MOBILE_UA =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148'
 
 const QQ_HEADERS = {
   'User-Agent': UA,
@@ -94,8 +99,9 @@ export function extractQqPlaylistId(raw: string): string | null {
 }
 
 /**
- * 从 kg 歌单链接提取 specialid。
- * 支持：special/single/ID、m.kugou.com/plist/list/ID、specialid=、global_collection_id 中的数字段。
+ * 从 kg 歌单链接提取 specialid（数字）。
+ * 支持：special/single/ID、m.kugou.com/plist/list/ID、songlist/数字、specialid=。
+ * 注意：`/songlist/gcid_xxx` 不是 specialid，见 extractKugouGcid + resolveKugouSpecialId。
  */
 export function extractKugouPlaylistId(raw: string): string | null {
   const s = raw.trim()
@@ -104,16 +110,127 @@ export function extractKugouPlaylistId(raw: string): string | null {
   const path =
     s.match(/kugou\.com\/yy\/special\/single\/(\d+)/i) ||
     s.match(/m\.kugou\.com\/plist\/list\/(\d+)/i) ||
-    s.match(/kugou\.com\/songlist\/(\d+)/i) ||
+    s.match(/kugou\.com\/songlist\/(\d+)(?:\/|[?#]|$)/i) ||
     s.match(/\/special\/(\d+)\.html/i)
   if (path?.[1]) return path[1]
 
   const q = s.match(/[?&#](?:specialid|special_id|listid|id)=(\d{4,})/i)
   if (q?.[1] && /kugou\.com/i.test(s)) return q[1]
 
-  // global_collection_id=collection_3_520033053_218_0 → 仍优先 specialid；若仅有 collection 数字串则取末段不可靠，跳过
   if (/^\d{4,}$/.test(s)) return s
 
+  return null
+}
+
+/**
+ * 酷狗分享链常见 gcid / src_cid（非数字 specialid）。
+ * 例：m.kugou.com/songlist/gcid_3z9vj1svz2yz0c4/?src_cid=3z9vj1svz2yz0c4
+ */
+export function extractKugouGcid(raw: string): string | null {
+  const s = raw.trim()
+  if (!s || !/kugou\.com/i.test(s)) return null
+  const path = s.match(/\/songlist\/(gcid_[A-Za-z0-9]+)/i)
+  if (path?.[1]) return path[1]
+  const src = s.match(/[?&#]src_cid=([A-Za-z0-9_]+)/i)?.[1]
+  if (!src) return null
+  return src.startsWith('gcid_') ? src : `gcid_${src}`
+}
+
+/**
+ * 从 kw 歌单链接提取 pid。
+ * 支持：m.kuwo.cn/newh5app/playlist_detail/ID、kuwo.cn/playlist_detail/ID、?pid=
+ */
+export function extractKuwoPlaylistId(raw: string): string | null {
+  const s = raw.trim()
+  if (!s) return null
+  const path =
+    s.match(/kuwo\.cn\/(?:newh5app\/)?playlist_detail\/(\d+)/i) ||
+    s.match(/kuwo\.cn\/playlist\/(\d+)/i)
+  if (path?.[1]) return path[1]
+  const q = s.match(/[?&#]pid=(\d{4,})/i)
+  if (q?.[1] && /kuwo\.cn/i.test(s)) return q[1]
+  return null
+}
+
+function extractSpecialIdFromKugouHtml(html: string): string | null {
+  return (
+    html.match(/"specialid"\s*:\s*(\d{4,})/i)?.[1] ||
+    html.match(/specialid["'\s:=]+(\d{4,})/i)?.[1] ||
+    null
+  )
+}
+
+/**
+ * 将 gcid 分享页解析为可用的数字 specialid（优先拉 m 站，避免 www SPA 空壳）。
+ */
+export async function resolveKugouSpecialId(
+  raw: string,
+  opts?: { signal?: AbortSignal },
+): Promise<string | null> {
+  const numeric = extractKugouPlaylistId(raw)
+  if (numeric) return numeric
+  const gcid = extractKugouGcid(raw)
+  if (!gcid) return null
+
+  const candidates = [
+    `https://m.kugou.com/songlist/${gcid}/`,
+    `https://m.kugou.com/songlist/${gcid}`,
+  ]
+  for (const pageUrl of candidates) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
+    try {
+      const res = await fetchWithTimeout(
+        pageUrl,
+        {
+          method: 'GET',
+          redirect: 'manual',
+          headers: {
+            'User-Agent': KG_MOBILE_UA,
+            Referer: 'https://m.kugou.com/',
+          },
+          signal: opts?.signal,
+        },
+        20000,
+      )
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get('location')
+        if (loc) {
+          const next = new URL(loc, pageUrl).href
+          // 跟到仍是 m 站的跳转；www 空壳无 specialid，跳过
+          if (/m\.kugou\.com/i.test(next)) {
+            const res2 = await fetchWithTimeout(
+              next,
+              {
+                method: 'GET',
+                redirect: 'follow',
+                headers: {
+                  'User-Agent': KG_MOBILE_UA,
+                  Referer: 'https://m.kugou.com/',
+                },
+                signal: opts?.signal,
+              },
+              20000,
+            )
+            if (res2.ok) {
+              const id = extractSpecialIdFromKugouHtml(await res2.text())
+              if (id) return id
+            }
+          }
+        }
+        continue
+      }
+      if (!res.ok) continue
+      const id = extractSpecialIdFromKugouHtml(await res.text())
+      if (id) return id
+    } catch (err: unknown) {
+      const e = err as { name?: string }
+      if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
+    }
+  }
   return null
 }
 
@@ -132,6 +249,36 @@ function albumName(song: any): string {
   return song?.albumname || song?.albumName || ''
 }
 
+function qqAlbumCoverUrl(song: any): string | undefined {
+  const mid = String(
+    song?.album?.mid || song?.album?.pmid || song?.albummid || song?.albumMid || '',
+  )
+  if (!mid) return undefined
+  return `https://y.qq.com/music/photo_new/T002R300x300M000${mid}.jpg`
+}
+
+function kwCoverUrl(song: Record<string, unknown>): string | undefined {
+  const pic = String(
+    song.web_albumpic_short || song.albumpic || song.pic || song.album_pic || '',
+  ).trim()
+  if (!pic) return undefined
+  if (/^https?:\/\//i.test(pic)) return pic
+  return `https://img2.kuwo.cn/star/albumcover/${pic}`
+}
+
+function kgCoverUrl(song: Record<string, unknown>): string | undefined {
+  const albumInfo = song.albuminfo as Record<string, unknown> | undefined
+  const raw =
+    song.Image ||
+    song.imgurl ||
+    song.cover ||
+    song.album_img ||
+    albumInfo?.sizable_cover ||
+    albumInfo?.img
+  if (typeof raw !== 'string' || !raw.trim()) return undefined
+  return raw.replace('{size}', '240')
+}
+
 function songTitle(song: any): string {
   return song?.name || song?.songname || song?.title || '未知'
 }
@@ -140,17 +287,52 @@ function songMid(song: any): string {
   return String(song?.mid || song?.songmid || song?.song_mid || '')
 }
 
+/** 用平台 id 合成音源脚本可用的最小 musicInfo，供歌单直通入队 */
+function buildMusicInfoFromIds(input: {
+  platform: string
+  externalId: string
+  title: string
+  artist: string
+  album?: string
+  img?: string
+}): Record<string, unknown> {
+  return {
+    name: input.title,
+    singer: input.artist,
+    albumName: input.album || '',
+    songmid: input.externalId,
+    hash: input.externalId,
+    source: input.platform,
+    ...(input.img ? { img: input.img } : {}),
+  }
+}
+
 function mapQqSongs(songs: any[]): PlaylistTrackDraft[] {
   return (songs || [])
     .map((s: any) => {
       const mid = songMid(s)
+      const title = songTitle(s)
+      const artist = joinArtists(s.singer)
+      const album = albumName(s)
+      const img = qqAlbumCoverUrl(s)
       return {
         externalId: mid || undefined,
-        title: songTitle(s),
-        artist: joinArtists(s.singer),
-        album: albumName(s),
+        title,
+        artist,
+        album,
         duration: Number(s.interval || 0) || undefined,
         platform: 'tx',
+        musicInfo: mid
+          ? buildMusicInfoFromIds({
+              platform: 'tx',
+              externalId: mid,
+              title,
+              artist,
+              album,
+              img,
+            })
+          : undefined,
+        matchMethod: mid ? 'id' : undefined,
       } satisfies PlaylistTrackDraft
     })
     .filter((t) => t.title && t.title !== '未知')
@@ -158,17 +340,23 @@ function mapQqSongs(songs: any[]): PlaylistTrackDraft[] {
 
 async function fetchWithTimeout(url: string, init?: RequestInit, ms = 20000): Promise<Response> {
   const controller = new AbortController()
+  const signal = init?.signal ? AbortSignal.any([init.signal, controller.signal]) : controller.signal
   const t = setTimeout(() => controller.abort(), ms)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    return await fetch(url, { ...init, signal })
   } finally {
     clearTimeout(t)
   }
 }
 
 /** kg CDN 证书常与域名不匹配，用 Node http(s) 且不校验证书 */
-function fetchKugouJson(url: string, headers: Record<string, string>, ms = 20000): Promise<any> {
+function fetchKugouJson(url: string, headers: Record<string, string>, ms = 20000, signal?: AbortSignal): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      return reject(err)
+    }
     try {
       const u = new URL(url)
       const lib = u.protocol === 'http:' ? httpRequestPlain : httpsRequest
@@ -182,7 +370,7 @@ function fetchKugouJson(url: string, headers: Record<string, string>, ms = 20000
           headers,
           timeout: ms,
           rejectUnauthorized: false,
-        } as any,
+        } as unknown as Record<string, unknown>,
         (res) => {
           const chunks: Buffer[] = []
           res.on('data', (c) => chunks.push(c))
@@ -200,7 +388,22 @@ function fetchKugouJson(url: string, headers: Record<string, string>, ms = 20000
           })
         },
       )
-      req.on('error', reject)
+      const onAbort = () => {
+        req.destroy()
+        const err = new Error('The operation was aborted')
+        err.name = 'AbortError'
+        reject(err)
+      }
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      req.on('error', (err) => {
+        if (signal) signal.removeEventListener('abort', onAbort)
+        reject(err)
+      })
+      req.on('close', () => {
+        if (signal) signal.removeEventListener('abort', onAbort)
+      })
       req.on('timeout', () => {
         req.destroy()
         reject(new Error('timeout'))
@@ -216,28 +419,60 @@ function fetchKugouJson(url: string, headers: Record<string, string>, ms = 20000
  * 跟随短链 / 302，尽量得到可提取 id 的最终 URL。
  * 也会从 HTML 中兜底抓取 playlist id。
  */
-export async function resolvePlaylistUrl(input: string): Promise<string> {
+export async function resolvePlaylistUrl(input: string, opts?: { signal?: AbortSignal }): Promise<string> {
   let current = input.trim()
   if (!/^https?:\/\//i.test(current)) return current
 
   for (let i = 0; i < 5; i++) {
-    if (extractQqPlaylistId(current) || extractNeteasePlaylistId(current)) return current
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
+    if (
+      extractQqPlaylistId(current) ||
+      extractNeteasePlaylistId(current) ||
+      extractKugouPlaylistId(current) ||
+      extractKuwoPlaylistId(current)
+    ) {
+      return current
+    }
+
+    // 酷狗 gcid 分享链：用 m 站解析 specialid，避免跟到 www 空壳
+    if (/kugou\.com/i.test(current) && extractKugouGcid(current)) {
+      const specialId = await resolveKugouSpecialId(current, opts)
+      if (specialId) return `https://www.kugou.com/yy/special/single/${specialId}.html`
+    }
 
     const res = await fetchWithTimeout(current, {
       method: 'GET',
       redirect: 'manual',
-      headers: { 'User-Agent': UA, Referer: 'https://y.qq.com/' },
+      headers: {
+        'User-Agent': /kugou\.com/i.test(current) ? KG_MOBILE_UA : UA,
+        Referer: /kugou\.com/i.test(current)
+          ? 'https://m.kugou.com/'
+          : /kuwo\.cn/i.test(current)
+            ? 'https://m.kuwo.cn/'
+            : 'https://y.qq.com/',
+      },
+      signal: opts?.signal,
     })
-
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location')
       if (!loc) break
-      current = new URL(loc, current).href
+      const next = new URL(loc, current).href
+      // 酷狗 gcid：m→www 空壳无 id，改为走 resolveKugouSpecialId
+      if (/\/songlist\/gcid_[A-Za-z0-9]+/i.test(current) && /www\.kugou\.com\/songlist/i.test(next)) {
+        const specialId = await resolveKugouSpecialId(current, opts)
+        if (specialId) return `https://www.kugou.com/yy/special/single/${specialId}.html`
+        break
+      }
+      current = next
       continue
     }
 
     const ct = res.headers.get('content-type') || ''
-    if (ct.includes('text/html') || ct.includes('text/plain')) {
+    if (ct.includes('text/html') || ct.includes('text/plain') || !ct) {
       const html = await res.text()
       const qqId =
         html.match(/y\.qq\.com\/[^"'\\\s]*playlist\/(\d+)/i)?.[1] ||
@@ -246,10 +481,15 @@ export async function resolvePlaylistUrl(input: string): Promise<string> {
       if (qqId) return `https://y.qq.com/n/ryqq/playlist/${qqId}`
 
       const kgId =
+        extractSpecialIdFromKugouHtml(html) ||
         html.match(/kugou\.com\/yy\/special\/single\/(\d+)/i)?.[1] ||
-        html.match(/m\.kugou\.com\/plist\/list\/(\d+)/i)?.[1] ||
-        html.match(/specialid["'\s:=]+(\d{4,})/i)?.[1]
+        html.match(/m\.kugou\.com\/plist\/list\/(\d+)/i)?.[1]
       if (kgId) return `https://www.kugou.com/yy/special/single/${kgId}.html`
+
+      const kwId =
+        html.match(/kuwo\.cn\/(?:newh5app\/)?playlist_detail\/(\d+)/i)?.[1] ||
+        html.match(/["']pid["']\s*:\s*["']?(\d{5,})/i)?.[1]
+      if (kwId) return `https://m.kuwo.cn/newh5app/playlist_detail/${kwId}`
 
       const wy =
         html.match(/https?:\/\/[^"'\\\s]*music\.163\.com[^"'\\\s]*playlist[^"'\\\s]*/i)?.[0] ||
@@ -260,19 +500,26 @@ export async function resolvePlaylistUrl(input: string): Promise<string> {
         if (id) return `https://music.163.com/playlist?id=${id}`
       }
     }
+
     break
   }
+
   return current
 }
 
-async function fetchQqViaMusicu(id: string, url: string): Promise<PlaylistDraft> {
+async function fetchQqViaMusicu(id: string, url: string, opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void }): Promise<PlaylistDraft> {
   const pageSize = 100
   let begin = 0
   let title = `歌单 ${id}`
-  const all: any[] = []
+  const all: unknown[] = []
   let total = Infinity
 
   while (begin < total && begin < 5000) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
     const body = {
       comm: { ct: 24, cv: 0 },
       req_0: {
@@ -291,17 +538,26 @@ async function fetchQqViaMusicu(id: string, url: string): Promise<PlaylistDraft>
       method: 'POST',
       headers: { ...QQ_HEADERS, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: opts?.signal,
     })
     if (!res.ok) throw new Error(`musicu HTTP ${res.status}`)
-    const data = await res.json()
-    const payload = data?.req_0?.data
-    if (data?.req_0?.code !== 0 || payload?.code !== 0) {
-      throw new Error(`musicu code ${data?.req_0?.code}/${payload?.code}`)
+    const data = await res.json() as Record<string, unknown>
+    const payload = (data?.req_0 as Record<string, unknown>)?.data as Record<string, unknown>
+    if ((data?.req_0 as Record<string, unknown>)?.code !== 0 || payload?.code !== 0) {
+      throw new Error(`musicu code ${(data?.req_0 as Record<string, unknown>)?.code}/${payload?.code}`)
     }
-    title = payload?.dirinfo?.title || title
-    total = Number(payload?.dirinfo?.songnum || 0) || total
-    const chunk = payload?.songlist || []
+    const dirinfo = payload?.dirinfo as Record<string, unknown> | undefined
+    title = (dirinfo?.title as string) || title
+    total = Number(dirinfo?.songnum || 0) || total
+    const chunk = (payload?.songlist as unknown[]) || []
     all.push(...chunk)
+    if (opts?.onProgress) {
+      opts.onProgress({
+        index: all.length,
+        total: Number.isFinite(total) ? total : all.length,
+        title,
+      })
+    }
     if (!chunk.length || chunk.length < pageSize) break
     begin += chunk.length
   }
@@ -311,53 +567,74 @@ async function fetchQqViaMusicu(id: string, url: string): Promise<PlaylistDraft>
   return { platform: 'tx', title, url, tracks }
 }
 
-async function fetchQqViaV8(id: string, url: string): Promise<PlaylistDraft> {
+async function fetchQqViaV8(id: string, url: string, opts?: { signal?: AbortSignal }): Promise<PlaylistDraft> {
   const api =
     `https://c.y.qq.com/v8/fcg-bin/fcg_v8_playlist_cp.fcg?newsong=1&id=${encodeURIComponent(id)}` +
     `&format=json&inCharset=utf-8&outCharset=utf-8`
-  const res = await fetchWithTimeout(api, { headers: QQ_HEADERS })
+  const res = await fetchWithTimeout(api, { headers: QQ_HEADERS, signal: opts?.signal })
   if (!res.ok) throw new Error(`v8 HTTP ${res.status}`)
-  const data = await res.json()
+  const data = await res.json() as Record<string, unknown>
   if (data?.code !== 0) throw new Error(`v8 code ${data?.code}`)
-  const cd = data?.data?.cdlist?.[0]
-  if (!cd) throw new Error('v8 无歌单')
-  const tracks = mapQqSongs(cd.songlist || [])
+  const cd = (data?.data as Record<string, unknown>)?.cdlist as Array<Record<string, unknown>> | undefined
+  const cd0 = cd?.[0]
+  if (!cd0) throw new Error('v8 无歌单')
+  const tracks = mapQqSongs((cd0.songlist as unknown[]) || [])
   if (!tracks.length) throw new Error('v8 无曲目')
   return {
     platform: 'tx',
-    title: cd.dissname || `歌单 ${id}`,
+    title: (cd0.dissname as string) || `歌单 ${id}`,
     url,
     tracks,
   }
 }
 
-async function fetchQqViaGetCdInfo(id: string, url: string): Promise<PlaylistDraft> {
+async function fetchQqViaGetCdInfo(id: string, url: string, opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void }): Promise<PlaylistDraft> {
   const pageSize = 100
   let begin = 0
   let title = `歌单 ${id}`
-  const all: any[] = []
+  const all: unknown[] = []
   let total = Infinity
 
   while (begin < total && begin < 5000) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
     const api =
       `https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0` +
       `&new_format=1&disstid=${encodeURIComponent(id)}&format=json&inCharset=utf8&outCharset=utf-8` +
       `&platform=yqq.json&needNewCode=0&song_begin=${begin}&song_num=${pageSize}`
-    const res = await fetchWithTimeout(api, { headers: QQ_HEADERS })
+    const res = await fetchWithTimeout(api, { headers: QQ_HEADERS, signal: opts?.signal })
     if (!res.ok) throw new Error(`getcdinfo HTTP ${res.status}`)
-    const data = await res.json()
+    const data = await res.json() as Record<string, unknown>
     if (data?.code !== 0) throw new Error(`getcdinfo code ${data?.code}`)
-    const cd = data?.cdlist?.[0]
-    if (!cd) throw new Error('getcdinfo 无歌单')
-    title = cd.dissname || title
-    total = Number(cd.songnum || 0) || total
-    const chunk = cd.songlist || []
+    const cd = (data?.cdlist as Array<Record<string, unknown>>) || []
+    const cd0 = cd[0]
+    if (!cd0) throw new Error('getcdinfo 无歌单')
+    title = (cd0.dissname as string) || title
+    total = Number(cd0.songnum || 0) || total
+    const chunk = (cd0.songlist as unknown[]) || []
     // 首次拿全量时接口可能一次返回全部
     if (begin === 0 && chunk.length >= total) {
       all.push(...chunk)
+      if (opts?.onProgress) {
+        opts.onProgress({
+          index: all.length,
+          total: Number.isFinite(total) ? total : all.length,
+          title,
+        })
+      }
       break
     }
     all.push(...chunk)
+    if (opts?.onProgress) {
+      opts.onProgress({
+        index: all.length,
+        total: Number.isFinite(total) ? total : all.length,
+        title,
+      })
+    }
     if (!chunk.length || chunk.length < pageSize) break
     begin += chunk.length
   }
@@ -367,7 +644,7 @@ async function fetchQqViaGetCdInfo(id: string, url: string): Promise<PlaylistDra
   return { platform: 'tx', title, url, tracks }
 }
 
-async function parseQqPlaylist(id: string, url: string): Promise<PlaylistDraft> {
+async function parseQqPlaylist(id: string, url: string, opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void }): Promise<PlaylistDraft> {
   const errors: string[] = []
   const fetchers = [
     { name: 'musicu', fn: fetchQqViaMusicu },
@@ -375,10 +652,17 @@ async function parseQqPlaylist(id: string, url: string): Promise<PlaylistDraft> 
     { name: 'getcdinfo', fn: fetchQqViaGetCdInfo },
   ]
   for (const { name, fn } of fetchers) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
     try {
-      return await fn(id, url)
-    } catch (err: any) {
-      errors.push(`${name}: ${err?.message || err}`)
+      return await fn(id, url, opts)
+    } catch (err: unknown) {
+      const e = err as { name?: string; message?: string }
+      if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
+      errors.push(`${name}: ${e?.message || String(err)}`)
     }
   }
   throw createError({
@@ -396,7 +680,147 @@ function splitKgFilename(filename: string): { artist: string; title: string } {
   return { artist: '未知', title: raw || '未知' }
 }
 
-async function parseKugouPlaylist(id: string, url: string): Promise<PlaylistDraft> {
+/** 酷狗安卓客户端常用签名盐（公开逆向约定） */
+const KG_ANDROID_SALT = 'OIlwieks28dk2k092lksi2UIkp'
+
+/** @internal 单测可见 */
+export function signKugouAndroidParams(params: Record<string, string>): string {
+  const body = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('')
+  return createHash('md5').update(`${KG_ANDROID_SALT}${body}${KG_ANDROID_SALT}`).digest('hex')
+}
+
+function mapKugouPlaylistSongs(rows: unknown[]): PlaylistTrackDraft[] {
+  return rows
+    .map((s: unknown) => {
+      const song = (s || {}) as Record<string, unknown>
+      const hash = String(song.hash || song['320hash'] || '')
+      const split = splitKgFilename(
+        String(song.name || song.filename || song.songname || song.fileName || ''),
+      )
+      const albumInfo = song.albuminfo as Record<string, unknown> | undefined
+      const album = String(song.album_name || albumInfo?.name || '')
+      const img = kgCoverUrl(song)
+      return {
+        externalId: hash || undefined,
+        title: split.title,
+        artist: split.artist,
+        album,
+        duration: Number(song.duration || song.timelength || 0) || undefined,
+        platform: 'kg',
+        musicInfo: hash
+          ? buildMusicInfoFromIds({
+              platform: 'kg',
+              externalId: hash,
+              title: split.title,
+              artist: split.artist,
+              album,
+              img,
+            })
+          : undefined,
+        matchMethod: hash ? 'id' : undefined,
+      } satisfies PlaylistTrackDraft
+    })
+    .filter((t) => t.title && t.title !== '未知')
+}
+
+/**
+ * 优先走 pubsongs `get_other_list_file`（与 App 曲目量一致）；
+ * 旧版 mobilecdn `special/song` 对部分超长歌单会把 total 截断（如 988→735）。
+ */
+async function fetchKugouPlaylistSongsViaPubsongs(
+  specialId: string,
+  opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void },
+  progressTitle = '',
+): Promise<unknown[]> {
+  const pageSize = 100
+  const mid = 'miyin_kg_playlist_mid_0001'
+  const all: unknown[] = []
+  let total = Number.POSITIVE_INFINITY
+  let page = 1
+
+  while (all.length < total && page <= 50) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
+    const clienttime = String(Math.floor(Date.now() / 1000))
+    const params: Record<string, string> = {
+      specialid: specialId,
+      specalidpgc: specialId,
+      need_sort: '1',
+      module: 'CloudMusic',
+      clientver: '11239',
+      pagesize: String(pageSize),
+      userid: '0',
+      page: String(page),
+      type: '0',
+      area_code: '1',
+      appid: '1005',
+      clienttime,
+      mid,
+      dfid: '-',
+    }
+    params.signature = signKugouAndroidParams(params)
+    const qs = new URLSearchParams(params).toString()
+    const headers = {
+      'User-Agent': 'Android9-AndroidPhone-11239-18-0-playlist-wifi',
+      Referer: 'https://m.kugou.com/',
+      mid,
+      dfid: '-',
+      clienttime,
+      'x-router': 'pubsongscdn.kugou.com',
+    }
+    const hosts = [
+      'http://gatewayretry.kugou.com',
+      'https://gatewayretry.kugou.com',
+      'http://gateway.kugou.com',
+    ]
+    let data: Record<string, unknown> | null = null
+    const errors: string[] = []
+    for (const host of hosts) {
+      try {
+        data = (await fetchKugouJson(
+          `${host}/v2/get_other_list_file?${qs}`,
+          headers,
+          20000,
+          opts?.signal,
+        )) as Record<string, unknown>
+        break
+      } catch (err: unknown) {
+        const e = err as { name?: string; message?: string }
+        if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
+        errors.push(`${host}: ${e?.message || String(err)}`)
+      }
+    }
+    if (!data) throw new Error(errors.join('；') || 'pubsongs unavailable')
+    if (data.status !== 1 && data.error_code !== 0 && data.error_code !== '0') {
+      throw new Error(`kugou pubsongs ${data.error_code}/${data.status}: ${data.errmsg || data.error || ''}`)
+    }
+    const dataObj = (data.data || {}) as Record<string, unknown>
+    if (page === 1) {
+      const t = Number(dataObj.count ?? dataObj.total ?? 0)
+      if (Number.isFinite(t) && t > 0) total = t
+    }
+    const chunk = (dataObj.info as unknown[]) || []
+    all.push(...chunk)
+    if (opts?.onProgress) {
+      opts.onProgress({
+        index: all.length,
+        total: Number.isFinite(total) ? total : all.length,
+        title: progressTitle,
+      })
+    }
+    if (!chunk.length || chunk.length < pageSize) break
+    page += 1
+  }
+  return all
+}
+
+async function parseKugouPlaylist(id: string, url: string, opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void }): Promise<PlaylistDraft> {
   const headers = { 'User-Agent': UA, Referer: 'https://www.kugou.com/' }
   // CDN 证书常与域名不匹配，优先 http；多域名回退
   const hosts = [
@@ -408,10 +832,17 @@ async function parseKugouPlaylist(id: string, url: string): Promise<PlaylistDraf
   async function getJson(path: string) {
     const errors: string[] = []
     for (const host of hosts) {
+      if (opts?.signal?.aborted) {
+        const err = new Error('The operation was aborted')
+        err.name = 'AbortError'
+        throw err
+      }
       try {
-        return await fetchKugouJson(`${host}${path}`, headers)
-      } catch (err: any) {
-        errors.push(`${host}: ${err?.message || err}`)
+        return (await fetchKugouJson(`${host}${path}`, headers, 20000, opts?.signal)) as Record<string, unknown>
+      } catch (err: unknown) {
+        const e = err as { name?: string; message?: string }
+        if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
+        errors.push(`${host}: ${e?.message || String(err)}`)
       }
     }
     throw new Error(errors.join('；') || `${platformLabel('kg')} 接口不可用`)
@@ -420,95 +851,211 @@ async function parseKugouPlaylist(id: string, url: string): Promise<PlaylistDraf
   let title = `歌单 ${id}`
   try {
     const info = await getJson(`/api/v3/special/info?specialid=${encodeURIComponent(id)}`)
-    title = info?.data?.specialname || title
+    const data = info?.data as Record<string, unknown> | undefined
+    title = (data?.specialname as string) || title
   } catch {
     /* ignore title failure */
   }
 
-  const pageSize = 50
-  let page = 1
-  let total = Infinity
-  const all: any[] = []
-  while (all.length < total && page <= 40) {
-    const data = await getJson(
-      `/api/v3/special/song?specialid=${encodeURIComponent(id)}&page=${page}&pagesize=${pageSize}&area_code=1`,
-    )
-    if (data?.status !== 1 && data?.errcode !== 0) {
-      throw new Error(`kugou code ${data?.errcode}/${data?.status}`)
+  let all: unknown[] = []
+  try {
+    all = await fetchKugouPlaylistSongsViaPubsongs(id, opts, title)
+  } catch (err: unknown) {
+    const e = err as { name?: string }
+    if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
+    // 回退旧接口（可能截断超长歌单）
+    const pageSize = 50
+    let page = 1
+    let total = Infinity
+    all = []
+    while (all.length < total && page <= 40) {
+      if (opts?.signal?.aborted) {
+        const err2 = new Error('The operation was aborted')
+        err2.name = 'AbortError'
+        throw err2
+      }
+      const data = await getJson(
+        `/api/v3/special/song?specialid=${encodeURIComponent(id)}&page=${page}&pagesize=${pageSize}&area_code=1`,
+      )
+      if (data?.status !== 1 && data?.errcode !== 0) {
+        throw new Error(`kugou code ${data?.errcode}/${data?.status}`)
+      }
+      const dataObj = data?.data as Record<string, unknown> | undefined
+      const chunk = (dataObj?.info as unknown[]) || []
+      total = Number(dataObj?.total || 0) || total
+      all.push(...chunk)
+      if (opts?.onProgress) {
+        opts.onProgress({
+          index: all.length,
+          total: Number.isFinite(total) ? total : all.length,
+          title,
+        })
+      }
+      if (!chunk.length || chunk.length < pageSize) break
+      page += 1
     }
-    const chunk = data?.data?.info || []
-    total = Number(data?.data?.total || 0) || total
-    all.push(...chunk)
-    if (!chunk.length || chunk.length < pageSize) break
-    page += 1
   }
 
-  const tracks: PlaylistTrackDraft[] = all
-    .map((s: any) => {
-      const hash = String(s.hash || s['320hash'] || '')
-      const split = splitKgFilename(s.filename || s.songname || '')
-      return {
-        externalId: hash || undefined,
-        title: split.title,
-        artist: split.artist,
-        album: s.album_name || '',
-        duration: Number(s.duration || 0) || undefined,
-        platform: 'kg',
-      } satisfies PlaylistTrackDraft
-    })
-    .filter((t) => t.title && t.title !== '未知')
+  const tracks = mapKugouPlaylistSongs(all)
 
   if (!tracks.length) throw new Error(`${platformLabel('kg')} 歌单无曲目或接口失败`)
   return { platform: 'kg', title, url, tracks }
 }
 
+async function parseKuwoPlaylist(
+  id: string,
+  url: string,
+  opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void },
+): Promise<PlaylistDraft> {
+  const pageSize = 100
+  let page = 1
+  let total = Number.POSITIVE_INFINITY
+  const all: unknown[] = []
+  let title = `歌单 ${id}`
+  const headers = {
+    'User-Agent': KG_MOBILE_UA,
+    Referer: 'https://m.kuwo.cn/',
+  }
+
+  while (all.length < total && page <= 50) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
+    const api =
+      `https://m.kuwo.cn/newh5app/wapi/api/www/playlist/playListInfo` +
+      `?pid=${encodeURIComponent(id)}&pn=${page}&rn=${pageSize}`
+    const res = await fetchWithTimeout(api, { headers, signal: opts?.signal })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = (await res.json()) as Record<string, unknown>
+    if (data?.code != null && Number(data.code) !== 200) {
+      throw new Error(`kuwo code ${data.code}`)
+    }
+    const payload = (data?.data || {}) as Record<string, unknown>
+    if (page === 1) {
+      title = String(payload.name || payload.title || title)
+      const t = Number(payload.total)
+      if (Number.isFinite(t) && t > 0) total = t
+    }
+    const chunk = (payload.musicList as unknown[]) || []
+    all.push(...chunk)
+    if (opts?.onProgress) {
+      opts.onProgress({
+        index: all.length,
+        total: Number.isFinite(total) ? total : all.length,
+        title,
+      })
+    }
+    if (!chunk.length || chunk.length < pageSize) break
+    page += 1
+  }
+
+  const tracks: PlaylistTrackDraft[] = all
+    .map((s: unknown) => {
+      const song = (s || {}) as Record<string, unknown>
+      const rid = String(song.rid || String(song.musicrid || '').replace(/^MUSIC_/i, '') || '')
+      const name = String(song.name || song.SONGNAME || '未知')
+      const artist = String(song.artist || song.ARTIST || '未知')
+      const album = String(song.album || song.ALBUM || '')
+      const img = kwCoverUrl(song)
+      return {
+        externalId: rid || undefined,
+        title: name,
+        artist,
+        album,
+        duration: Number(song.duration || 0) || undefined,
+        platform: 'kw',
+        musicInfo: rid
+          ? buildMusicInfoFromIds({
+              platform: 'kw',
+              externalId: rid,
+              title: name,
+              artist,
+              album,
+              img,
+            })
+          : undefined,
+        matchMethod: rid ? 'id' : undefined,
+      } satisfies PlaylistTrackDraft
+    })
+    .filter((t) => t.title && t.title !== '未知')
+
+  if (!tracks.length) throw new Error(`${platformLabel('kw')} 歌单无曲目或接口失败`)
+  return { platform: 'kw', title, url, tracks }
+}
+
 /**
  * 解析歌单链接：
- * - wy / tx / kg
+ * - wy / tx / kg / kw
  */
-export async function parsePlaylist(url: string): Promise<PlaylistDraft> {
+export async function parsePlaylist(
+  url: string,
+  opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void },
+): Promise<PlaylistDraft> {
   const raw = url.trim()
   if (!raw) throw createError({ statusCode: 400, statusMessage: '请输入歌单链接' })
+  if (opts?.signal?.aborted) {
+    const err = new Error('The operation was aborted')
+    err.name = 'AbortError'
+    throw err
+  }
 
-  const resolved = await resolvePlaylistUrl(raw)
+  const resolved = await resolvePlaylistUrl(raw, opts)
   const haystack = `${raw}\n${resolved}`
 
   if (/y\.qq\.com|i\.y\.qq\.com|c\.y\.qq\.com/i.test(haystack)) {
     const qqId = extractQqPlaylistId(resolved) || extractQqPlaylistId(raw)
-    if (qqId) return await parseQqPlaylist(qqId, raw)
+    if (qqId) return await parseQqPlaylist(qqId, raw, opts)
   }
 
   if (/kugou\.com/i.test(haystack)) {
-    const kgId = extractKugouPlaylistId(resolved) || extractKugouPlaylistId(raw)
-    if (kgId) return await parseKugouPlaylist(kgId, raw)
+    const kgId =
+      extractKugouPlaylistId(resolved) ||
+      extractKugouPlaylistId(raw) ||
+      (await resolveKugouSpecialId(raw, opts)) ||
+      (await resolveKugouSpecialId(resolved, opts))
+    if (kgId) return await parseKugouPlaylist(kgId, raw, opts)
+  }
+
+  if (/kuwo\.cn/i.test(haystack)) {
+    const kwId = extractKuwoPlaylistId(resolved) || extractKuwoPlaylistId(raw)
+    if (kwId) return await parseKuwoPlaylist(kwId, raw, opts)
   }
 
   if (/music\.163\.com/i.test(haystack)) {
     const wyId = extractNeteasePlaylistId(resolved) || extractNeteasePlaylistId(raw)
-    if (wyId) return await parseNeteasePlaylist(wyId, raw)
+    if (wyId) return await parseNeteasePlaylist(wyId, raw, opts)
   }
 
   // 纯数字：先 wy → tx → kg
   if (/^\d{5,}$/.test(raw)) {
     try {
-      return await parseNeteasePlaylist(raw, raw)
-    } catch {
+      return await parseNeteasePlaylist(raw, raw, opts)
+    } catch (err: unknown) {
+      const e = err as { name?: string }
+      if (e?.name === 'AbortError' || opts?.signal?.aborted) throw err
       try {
-        return await parseQqPlaylist(raw, raw)
-      } catch {
-        return await parseKugouPlaylist(raw, raw)
+        return await parseQqPlaylist(raw, raw, opts)
+      } catch (err2: unknown) {
+        const e2 = err2 as { name?: string }
+        if (e2?.name === 'AbortError' || opts?.signal?.aborted) throw err2
+        return await parseKugouPlaylist(raw, raw, opts)
       }
     }
   }
 
   const qqId = extractQqPlaylistId(resolved) || extractQqPlaylistId(raw)
-  if (qqId && /qq\.com/i.test(haystack)) return await parseQqPlaylist(qqId, raw)
+  if (qqId && /qq\.com/i.test(haystack)) return await parseQqPlaylist(qqId, raw, opts)
 
   const kgId = extractKugouPlaylistId(resolved) || extractKugouPlaylistId(raw)
-  if (kgId && /kugou\.com/i.test(haystack)) return await parseKugouPlaylist(kgId, raw)
+  if (kgId && /kugou\.com/i.test(haystack)) return await parseKugouPlaylist(kgId, raw, opts)
+
+  const kwId = extractKuwoPlaylistId(resolved) || extractKuwoPlaylistId(raw)
+  if (kwId && /kuwo\.cn/i.test(haystack)) return await parseKuwoPlaylist(kwId, raw, opts)
 
   const wyId = extractNeteasePlaylistId(resolved) || extractNeteasePlaylistId(raw)
-  if (wyId) return await parseNeteasePlaylist(wyId, raw)
+  if (wyId) return await parseNeteasePlaylist(wyId, raw, opts)
 
   throw createError({
     statusCode: 400,
@@ -516,7 +1063,11 @@ export async function parsePlaylist(url: string): Promise<PlaylistDraft> {
   })
 }
 
-async function parseNeteasePlaylist(id: string, url: string): Promise<PlaylistDraft> {
+async function parseNeteasePlaylist(
+  id: string,
+  url: string,
+  opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void },
+): Promise<PlaylistDraft> {
   // 移动端头 + n 放大；完整曲目 ID 在 trackIds，tracks 往往只有预览几首
   const api = `https://music.163.com/api/v6/playlist/detail?id=${id}&n=100000&s=0`
   const res = await fetchWithTimeout(api, {
@@ -524,27 +1075,40 @@ async function parseNeteasePlaylist(id: string, url: string): Promise<PlaylistDr
       'User-Agent': WY_MOBILE_UA,
       Referer: 'https://music.163.com/m/',
     },
+    signal: opts?.signal,
   })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const data = await res.json()
+  const data = await res.json() as Record<string, unknown>
   if (data?.code && data.code !== 200) {
     throw createError({
       statusCode: 502,
       statusMessage: `${platformLabel('wy')} 歌单接口失败(${data.code}): ${data.msg || data.message || 'unknown'}`,
     })
   }
-  const pl = data?.playlist
+  const pl = data?.playlist as Record<string, unknown> | undefined
   if (!pl) throw createError({ statusCode: 502, statusMessage: '歌单不存在或接口失败' })
 
-  const previewTracks: PlaylistTrackDraft[] = (pl.tracks || []).map(mapNeteaseSong)
-  const trackIds: string[] = (pl.trackIds || [])
-    .map((t: any) => String(t?.id ?? t))
+  const previewTracks: PlaylistTrackDraft[] = ((pl.tracks as unknown[]) || []).map(mapNeteaseSong)
+  const trackIds: string[] = ((pl.trackIds as unknown[]) || [])
+    .map((t: unknown) => {
+      const item = t as { id?: unknown } | undefined
+      return String(item?.id ?? t)
+    })
     .filter((x: string) => /^\d+$/.test(x))
 
   let tracks = previewTracks
+  const title = (pl.name as string) || `歌单 ${id}`
+  if (opts?.onProgress) {
+    opts.onProgress({
+      index: previewTracks.length,
+      total: trackIds.length > previewTracks.length ? trackIds.length : previewTracks.length,
+      title,
+    })
+  }
+
   // PC/Web 常见：tracks 仅几首，trackIds 才是完整列表（如「喜欢的音乐」）
   if (trackIds.length > previewTracks.length) {
-    tracks = await fetchNeteaseSongsByIds(trackIds)
+    tracks = await fetchNeteaseSongsByIds(trackIds, opts)
     if (!tracks.length && previewTracks.length) tracks = previewTracks
   }
 
@@ -554,7 +1118,7 @@ async function parseNeteasePlaylist(id: string, url: string): Promise<PlaylistDr
 
   return {
     platform: 'wy',
-    title: pl.name || `歌单 ${id}`,
+    title,
     url,
     tracks,
   }
@@ -562,21 +1126,43 @@ async function parseNeteasePlaylist(id: string, url: string): Promise<PlaylistDr
 
 function mapNeteaseSong(s: any): PlaylistTrackDraft {
   const artists = s.ar || s.artists || []
+  const externalId = String(s.id)
+  const title = s.name || '未知'
+  const artist = artists.map((a: any) => a.name).filter(Boolean).join(' / ') || '未知'
+  const album = s.al?.name || s.album?.name || ''
+  const img = s.al?.picUrl || s.album?.picUrl || undefined
   return {
-    externalId: String(s.id),
-    title: s.name || '未知',
-    artist: artists.map((a: any) => a.name).filter(Boolean).join(' / ') || '未知',
-    album: s.al?.name || s.album?.name || '',
+    externalId,
+    title,
+    artist,
+    album,
     duration: Math.round((s.dt || s.duration || 0) / 1000),
     platform: 'wy',
+    musicInfo: buildMusicInfoFromIds({
+      platform: 'wy',
+      externalId,
+      title,
+      artist,
+      album,
+      img,
+    }),
+    matchMethod: 'id',
   }
 }
 
 /** 按 trackIds 分批拉取歌曲详情（对齐移动端补全歌单） */
-async function fetchNeteaseSongsByIds(ids: string[]): Promise<PlaylistTrackDraft[]> {
+async function fetchNeteaseSongsByIds(
+  ids: string[],
+  opts?: { signal?: AbortSignal; onProgress?: (p: { index: number; total: number; title: string }) => void },
+): Promise<PlaylistTrackDraft[]> {
   const BATCH = 200
   const byId = new Map<string, PlaylistTrackDraft>()
   for (let i = 0; i < ids.length; i += BATCH) {
+    if (opts?.signal?.aborted) {
+      const err = new Error('The operation was aborted')
+      err.name = 'AbortError'
+      throw err
+    }
     const batch = ids.slice(i, i + BATCH)
     const c = JSON.stringify(batch.map((sid) => ({ id: Number(sid) })))
     const api = `https://music.163.com/api/v3/song/detail?c=${encodeURIComponent(c)}`
@@ -585,15 +1171,23 @@ async function fetchNeteaseSongsByIds(ids: string[]): Promise<PlaylistTrackDraft
         'User-Agent': WY_MOBILE_UA,
         Referer: 'https://music.163.com/',
       },
+      signal: opts?.signal,
     })
     if (!res.ok) throw new Error(`song/detail HTTP ${res.status}`)
-    const data = await res.json()
+    const data = await res.json() as Record<string, unknown>
     if (data?.code !== 200 || !Array.isArray(data.songs)) {
-      throw new Error(data?.msg || data?.message || 'song/detail 失败')
+      throw new Error(String(data?.msg || data?.message || 'song/detail 失败'))
     }
     for (const s of data.songs) {
       const row = mapNeteaseSong(s)
       if (row.externalId) byId.set(row.externalId, row)
+    }
+    if (opts?.onProgress) {
+      opts.onProgress({
+        index: Math.min(i + BATCH, ids.length),
+        total: ids.length,
+        title: '网易云歌单',
+      })
     }
   }
   // 保持歌单原有顺序
@@ -628,22 +1222,45 @@ export type PlaylistMatchRow = {
 
 const CONFIRM_SCORE_THRESHOLD = 0.7
 
-/** 批量匹配曲目，低分/无命中标记 needsConfirm 供前端人工确认 */
+export type PlaylistMatchOptions = {
+  scoreThreshold?: number
+  concurrency?: number
+  signal?: AbortSignal
+  allowManualBypass?: boolean
+  onProgress?: (event: {
+    index: number
+    total: number
+    track: PlaylistTrackDraft
+    row: PlaylistMatchRow
+  }) => void | Promise<void>
+}
+
+/** 批量匹配曲目，支持并发、进度通知与中断信号 */
 export async function matchPlaylistTracks(
   tracks: PlaylistTrackDraft[],
-  opts?: { scoreThreshold?: number },
+  opts?: PlaylistMatchOptions,
 ): Promise<PlaylistMatchRow[]> {
   const threshold = opts?.scoreThreshold ?? CONFIRM_SCORE_THRESHOLD
-  const rows: PlaylistMatchRow[] = []
+  const concurrency = Math.max(1, Math.min(16, opts?.concurrency ?? 6))
+  const signal = opts?.signal
+  const rows: PlaylistMatchRow[] = new Array(tracks.length)
+  const total = tracks.length
 
-  for (let index = 0; index < tracks.length; index++) {
-    const track = tracks[index]!
+  const matchQueue = new PQueue({ concurrency })
+
+  const processSingleTrack = async (track: PlaylistTrackDraft, index: number): Promise<PlaylistMatchRow> => {
+    if (signal?.aborted) {
+      const err = new Error('Match operation aborted')
+      err.name = 'AbortError'
+      throw err
+    }
+
     try {
-      if (track.musicInfo) {
-        rows.push({
+      if (track.musicInfo && opts?.allowManualBypass) {
+        const row: PlaylistMatchRow = {
           index,
           track,
-          method: 'manual',
+          method: (track.matchMethod as any) || 'manual',
           score: 1,
           needsConfirm: false,
           selected: {
@@ -655,11 +1272,21 @@ export async function matchPlaylistTracks(
             musicInfo: track.musicInfo,
           },
           candidates: [],
-        })
-        continue
+        }
+        rows[index] = row
+        if (opts?.onProgress) {
+          await opts.onProgress({ index, total, track, row })
+        }
+        return row
       }
 
-      const candidates = await searchPlatform(track.platform, `${track.title} ${track.artist}`, 1)
+      const candidates = await searchPlatform(track.platform, `${track.title} ${track.artist}`, 1, { signal })
+      if (signal?.aborted) {
+        const err = new Error('Match operation aborted')
+        err.name = 'AbortError'
+        throw err
+      }
+
       const mapped = candidates.map((c) => ({
         externalId: c.externalId,
         title: c.title,
@@ -681,7 +1308,7 @@ export async function matchPlaylistTracks(
       )
 
       const needsConfirm = !matched.selected || matched.score < threshold
-      rows.push({
+      const row: PlaylistMatchRow = {
         index,
         track,
         method: matched.selected ? matched.method : 'none',
@@ -706,9 +1333,18 @@ export async function matchPlaylistTracks(
           score: c.score,
           musicInfo: c.musicInfo,
         })),
-      })
-    } catch (err: any) {
-      rows.push({
+      }
+      rows[index] = row
+      if (opts?.onProgress) {
+        await opts.onProgress({ index, total, track, row })
+      }
+      return row
+    } catch (err: unknown) {
+      const e = err as { name?: string; message?: string }
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw err
+      }
+      const row: PlaylistMatchRow = {
         index,
         track,
         method: 'none',
@@ -716,47 +1352,163 @@ export async function matchPlaylistTracks(
         needsConfirm: true,
         selected: null,
         candidates: [],
-        error: err?.message || String(err),
-      })
+        error: e?.message || String(err),
+      }
+      rows[index] = row
+      if (opts?.onProgress) {
+        await opts.onProgress({ index, total, track, row })
+      }
+      return row
     }
   }
 
-  return rows
+  const tasks = tracks.map((t, idx) => () => processSingleTrack(t, idx))
+
+  try {
+    await matchQueue.addAll(tasks, { signal })
+  } catch (err: unknown) {
+    const e = err as { name?: string }
+    if (e?.name === 'AbortError' || signal?.aborted) {
+      matchQueue.clear()
+      return rows.filter((r) => Boolean(r))
+    }
+    throw err
+  }
+
+  return rows.filter((r) => Boolean(r))
+}
+
+export type MatchAndEnqueueOptions = {
+  quality?: string
+  downloadLyric?: boolean
+  lyricMode?: 'external' | 'embedded'
+  onlyMatched?: boolean
+  concurrency?: number
+  /** When true, resolve album folder prefix once and attach to each task */
+  albumDownloadToFolder?: boolean
+  albumFolderTemplate?: string
+  /** Album-level artist for folder template `{artist}` */
+  albumArtist?: string
+  signal?: AbortSignal
+  onProgress?: (event: {
+    stage: 'parsing' | 'matching' | 'enqueuing'
+    index: number
+    total: number
+    title: string
+    ok?: boolean
+    error?: string
+  }) => void | Promise<void>
 }
 
 export async function matchAndEnqueuePlaylist(
   draft: PlaylistDraft,
-  opts?: { quality?: string; downloadLyric?: boolean; lyricMode?: 'external' | 'embedded'; onlyMatched?: boolean },
+  opts?: MatchAndEnqueueOptions,
 ) {
   // 入队前先探测下载目录可写，避免整批「成功 0」且无明确错误
-  assertDownloadDirWritable(getSettings().downloadDir)
+  const settings = getSettings()
+  assertDownloadDirWritable(settings.downloadDir)
+
+  const signal = opts?.signal
+  if (signal?.aborted) {
+    const err = new Error('Operation aborted')
+    err.name = 'AbortError'
+    throw err
+  }
+
+  const useAlbumFolder = opts?.albumDownloadToFolder === true
+  const folderPrefix = useAlbumFolder
+    ? applyFolderTemplate(opts?.albumFolderTemplate || settings.albumFolderTemplate, {
+        album: draft.title,
+        artist: opts?.albumArtist || draft.tracks[0]?.artist || '',
+        platform: draft.platform,
+      }) || undefined
+    : undefined
 
   const batchId = randomUUID()
-  const results: Array<{ title: string; ok: boolean; method?: string; error?: string; taskId?: string }> = []
+  const total = draft.tracks.length
+  const results: Array<{ title: string; ok: boolean; method?: string; error?: string; taskId?: string }> = new Array(total)
+  const toEnqueueList: Array<{
+    title: string
+    artist: string
+    album?: string
+    platform: string
+    quality?: string
+    musicInfo: Record<string, unknown>
+    externalId?: string
+    matchMethod?: string
+    downloadLyric?: boolean
+    lyricMode?: 'external' | 'embedded'
+    folderPrefix?: string
+    batchId?: string
+    playlistUrl?: string
+    resultIndex: number
+  }> = []
 
-  for (const track of draft.tracks) {
+  const concurrency = Math.max(1, Math.min(16, opts?.concurrency ?? 6))
+  const queue = new PQueue({ concurrency })
+  let finishedCount = 0
+
+  const processTrack = async (track: PlaylistTrackDraft, index: number) => {
+    if (signal?.aborted) {
+      const err = new Error('Operation aborted')
+      err.name = 'AbortError'
+      throw err
+    }
     try {
-      // 已人工确认 / 预解析
-      if (track.musicInfo) {
-        const task = enqueueDownload({
+      const directMusicInfo =
+        track.musicInfo ||
+        (track.externalId
+          ? buildMusicInfoFromIds({
+              platform: track.platform,
+              externalId: track.externalId,
+              title: track.title,
+              artist: track.artist,
+              album: track.album,
+            })
+          : null)
+
+      if (directMusicInfo) {
+        results[index] = {
+          title: track.title,
+          ok: true,
+          method: track.matchMethod || (track.musicInfo ? 'manual' : 'id'),
+        }
+        toEnqueueList.push({
           title: track.title,
           artist: track.artist,
           album: track.album,
           platform: track.platform,
           quality: opts?.quality,
-          musicInfo: track.musicInfo,
+          musicInfo: directMusicInfo,
           externalId: track.externalId,
-          matchMethod: track.matchMethod || 'manual',
+          matchMethod: track.matchMethod || (track.musicInfo ? 'manual' : 'id'),
           downloadLyric: opts?.downloadLyric,
           lyricMode: opts?.lyricMode,
+          folderPrefix,
           batchId,
           playlistUrl: draft.url,
+          resultIndex: index,
         })
-        results.push({ title: track.title, ok: true, method: track.matchMethod || 'manual', taskId: task.id })
-        continue
+        finishedCount++
+        if (opts?.onProgress) {
+          await opts.onProgress({
+            stage: 'matching',
+            index: finishedCount,
+            total,
+            title: track.title,
+            ok: true,
+          })
+        }
+        return
       }
 
-      const candidates = await searchPlatform(track.platform, `${track.title} ${track.artist}`, 1)
+      const candidates = await searchPlatform(track.platform, `${track.title} ${track.artist}`, 1, { signal })
+      if (signal?.aborted) {
+        const err = new Error('Operation aborted')
+        err.name = 'AbortError'
+        throw err
+      }
+
       const matched = matchTrack(
         {
           externalId: track.externalId,
@@ -779,12 +1531,24 @@ export async function matchAndEnqueuePlaylist(
       )
 
       if (!matched.selected) {
-        results.push({ title: track.title, ok: false, error: '未匹配到可下载条目' })
-        continue
+        results[index] = { title: track.title, ok: false, error: '未匹配到可下载条目' }
+        finishedCount++
+        if (opts?.onProgress) {
+          await opts.onProgress({
+            stage: 'matching',
+            index: finishedCount,
+            total,
+            title: track.title,
+            ok: false,
+            error: '未匹配到可下载条目',
+          })
+        }
+        return
       }
 
       const cand = matched.selected
-      const task = enqueueDownload({
+      results[index] = { title: track.title, ok: true, method: matched.method }
+      toEnqueueList.push({
         title: cand.title,
         artist: cand.artist,
         album: cand.album,
@@ -801,20 +1565,76 @@ export async function matchAndEnqueuePlaylist(
         matchMethod: matched.method,
         downloadLyric: opts?.downloadLyric,
         lyricMode: opts?.lyricMode,
+        folderPrefix,
         batchId,
         playlistUrl: draft.url,
+        resultIndex: index,
       })
-      results.push({ title: track.title, ok: true, method: matched.method, taskId: task.id })
-    } catch (err: any) {
-      results.push({ title: track.title, ok: false, error: err?.message || String(err) })
+      finishedCount++
+      if (opts?.onProgress) {
+        await opts.onProgress({
+          stage: 'matching',
+          index: finishedCount,
+          total,
+          title: track.title,
+          ok: true,
+        })
+      }
+    } catch (err: unknown) {
+      const e = err as { name?: string; message?: string }
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        throw err
+      }
+      results[index] = { title: track.title, ok: false, error: e?.message || String(err) }
+      finishedCount++
+      if (opts?.onProgress) {
+        await opts.onProgress({
+          stage: 'matching',
+          index: finishedCount,
+          total,
+          title: track.title,
+          ok: false,
+          error: e?.message || String(err),
+        })
+      }
     }
   }
 
+  const tasks = draft.tracks.map((t, idx) => () => processTrack(t, idx))
+  try {
+    await queue.addAll(tasks, { signal })
+  } catch (err: unknown) {
+    const e = err as { name?: string }
+    if (e?.name === 'AbortError' || signal?.aborted) {
+      queue.clear()
+      throw err
+    }
+    throw err
+  }
+
+  // 使用高性能分批事务批量入库，并静默单条 emitTask 以消除瞬时广播与 WAL 压力
+  if (toEnqueueList.length > 0) {
+    const batch = batchEnqueueDownload(toEnqueueList, { silent: true })
+    for (let j = 0; j < toEnqueueList.length; j++) {
+      const item = toEnqueueList[j]!
+      const res = results[item.resultIndex]
+      const br = batch.results[j]
+      if (!res) continue
+      if (br?.ok && br.id) {
+        res.taskId = br.id
+      } else {
+        res.ok = false
+        res.error = br?.error || '入队失败'
+      }
+    }
+  }
+
+  const finalResults = results.filter(Boolean)
   return {
     batchId,
     playlistTitle: draft.title,
     total: draft.tracks.length,
-    enqueued: results.filter((r) => r.ok).length,
-    results,
+    enqueued: finalResults.filter((r) => r.ok).length,
+    results: finalResults,
   }
 }

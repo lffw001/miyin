@@ -19,21 +19,36 @@ const open = defineModel<boolean>('open', { default: false })
 const props = withDefaults(
   defineProps<{
     result?: EnqueueResultPayload | null
+    continueLabel?: string
   }>(),
   {
     result: null,
+    continueLabel: '继续导入',
   },
 )
 
 const emit = defineEmits<{
   close: []
   viewQueue: []
+  retryFailed: [failedItems: EnqueueResultItem[]]
 }>()
 
 const items = computed(() => props.result?.results || [])
+const failedItems = computed(() => items.value.filter((x) => !x.ok))
 const failCount = computed(() => {
   if (!props.result) return 0
   return Math.max(0, props.result.total - props.result.enqueued)
+})
+
+const failureGroups = computed(() => {
+  const map = new Map<string, EnqueueResultItem[]>()
+  for (const item of failedItems.value) {
+    const key = item.error?.trim() || '未知原因'
+    const list = map.get(key) || []
+    list.push(item)
+    map.set(key, list)
+  }
+  return [...map.entries()].map(([reason, rows]) => ({ reason, rows }))
 })
 
 const summaryText = computed(() => {
@@ -43,16 +58,22 @@ const summaryText = computed(() => {
   if (enqueued === 0) return `未能入队（0 / ${total}）`
   return `成功入队 ${enqueued} / ${total} 首` + (failCount.value ? `，失败 ${failCount.value}` : '')
 })
-
 function onClose() {
   open.value = false
   emit('close')
 }
 
+function onRetryFailed() {
+  const failed = items.value.filter((it) => !it.ok)
+  open.value = false
+  emit('retryFailed', failed)
+}
+
 async function onViewQueue() {
   open.value = false
   emit('viewQueue')
-  await navigateTo('/queue')
+  const q = props.result?.batchId ? { batchId: props.result.batchId } : {}
+  await navigateTo({ path: '/queue', query: q })
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -80,6 +101,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <p id="enqueue-result-desc" class="desc">{{ summaryText }}</p>
         </div>
 
+        <div v-if="failureGroups.length" class="fail-groups" aria-label="失败汇总">
+          <div v-for="g in failureGroups" :key="g.reason" class="fail-group">
+            <p class="fail-reason">{{ g.reason }}（{{ g.rows.length }} 首）</p>
+            <ul class="fail-titles">
+              <li v-for="(row, i) in g.rows" :key="i">{{ row.title }}</li>
+            </ul>
+          </div>
+        </div>
+
         <div v-if="items.length" class="list" aria-label="入队明细">
           <div v-for="(item, i) in items" :key="i" class="result-row">
             <span class="mark" :class="item.ok ? 'ok' : 'err'">{{ item.ok ? '✓' : '✗' }}</span>
@@ -94,7 +124,15 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
         </div>
 
         <div class="footer">
-          <button class="btn btn-ghost" type="button" @click="onClose">继续导入</button>
+          <button
+            v-if="failCount > 0"
+            class="btn btn-retry"
+            type="button"
+            @click="onRetryFailed"
+          >
+            重试失败曲目 ({{ failCount }})
+          </button>
+          <button class="btn btn-ghost" type="button" @click="onClose">{{ continueLabel }}</button>
           <button class="btn" type="button" @click="onViewQueue">查看队列</button>
         </div>
       </div>
@@ -148,6 +186,33 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   font-size: 13px;
   color: var(--muted);
   line-height: 1.5;
+}
+.fail-groups {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--danger) 35%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--danger) 6%, var(--bg));
+  max-height: 120px;
+  overflow: auto;
+}
+.fail-group + .fail-group {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.fail-reason {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--danger);
+}
+.fail-titles {
+  margin: 0;
+  padding-left: 16px;
+  font-size: 12px;
+  color: var(--muted);
 }
 .list {
   flex: 1;
@@ -208,6 +273,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   justify-content: flex-end;
   gap: 8px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 .footer .btn {
   min-width: 88px;
@@ -215,7 +281,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
   font-size: 13px;
   border-radius: 8px;
 }
-
+.footer .btn-retry {
+  background: var(--accent, #6366f1);
+  color: #fff;
+  border: none;
+}
+.footer .btn-retry:hover {
+  opacity: 0.9;
+}
 @media (max-width: 768px) {
   .overlay {
     align-items: flex-end;

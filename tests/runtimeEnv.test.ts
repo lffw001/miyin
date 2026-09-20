@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { getAuthToken, getSessionSecret, getDownloadDirEnv } from '../server/utils/runtimeEnv'
+import { getAuthToken, getAuthTokenFromEnv, getSessionSecret, getDownloadDirEnv } from '../server/utils/runtimeEnv'
 
 describe('runtimeEnv', () => {
   const prev = { ...process.env }
@@ -19,12 +19,13 @@ describe('runtimeEnv', () => {
 
   it('prefers AUTH_TOKEN over empty for open mode detection', () => {
     process.env.AUTH_TOKEN = ''
+    expect(getAuthTokenFromEnv()).toBe('')
     expect(getAuthToken()).toBe('')
   })
 
   it('reads AUTH_TOKEN when set by fnOS/Docker', () => {
     process.env.AUTH_TOKEN = 'secret-from-wizard'
-    expect(getAuthToken()).toBe('secret-from-wizard')
+    expect(getAuthTokenFromEnv()).toBe('secret-from-wizard')
   })
 
   it('reads DOWNLOAD_DIR from process env', () => {
@@ -34,5 +35,13 @@ describe('runtimeEnv', () => {
 
   it('falls back session secret when unset', () => {
     expect(getSessionSecret().length).toBeGreaterThan(0)
+  })
+
+  it('generates unpredictable random session secret when unset (no hardcoded fallback)', () => {
+    const secret = getSessionSecret()
+    expect(secret).not.toBe('dev-change-me')
+    // 进程内稳定：同一进程多次取值一致，保证会话可校验
+    expect(getSessionSecret()).toBe(secret)
+    expect(secret.length).toBeGreaterThanOrEqual(64)
   })
 })
