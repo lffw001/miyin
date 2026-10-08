@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { buildDedupKey, buildSearchText } from '#shared/trackKey'
 import { getDbPath } from './paths'
 
 let dbInstance: Database.Database | null = null
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS download_tasks (
   playlist_url TEXT,
   music_info_json TEXT,
   file_size INTEGER,
+  dedup_key TEXT,
+  search_text TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -85,11 +88,93 @@ function migrateSchema(db: Database.Database) {
     db.exec(`ALTER TABLE sources ADD COLUMN update_info_json TEXT`)
   }
 
+  // 曲库检索能力层：判重键与检索文本（老库平滑升级，null 安全）
+  if (!taskNames.has('dedup_key')) {
+    db.exec(`ALTER TABLE download_tasks ADD COLUMN dedup_key TEXT`)
+  }
+  if (!taskNames.has('search_text')) {
+    db.exec(`ALTER TABLE download_tasks ADD COLUMN search_text TEXT`)
+  }
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
     CREATE INDEX IF NOT EXISTS idx_download_tasks_playlist_url ON download_tasks(playlist_url);
     CREATE INDEX IF NOT EXISTS idx_download_tasks_batch_id ON download_tasks(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_download_tasks_dedup_key ON download_tasks(dedup_key);
   `)
+}
+
+/** 单批回填条数：控制单事务锁占用与 WAL 峰值（与批量入队的分块策略一致） */
+const BACKFILL_CHUNK_SIZE = 200
+
+/**
+ * 分批回填 `dedup_key` / `search_text`（仅处理 `dedup_key IS NULL` 的行）。
+ *
+ * - 可中断可续：已回填的行不会再被选中
+ * - 已全部回填时是一次空查询，可直接在启动期调用
+ * - 返回本次回填的总行数
+ */
+export function backfillTrackKeys(opts?: { chunkSize?: number; maxRows?: number }): number {
+  const db = getDb()
+  const chunkSize = opts?.chunkSize ?? BACKFILL_CHUNK_SIZE
+  const maxRows = opts?.maxRows ?? Number.POSITIVE_INFINITY
+
+  const selectStmt = db.prepare(
+    `SELECT id, title, artist, album FROM download_tasks
+     WHERE dedup_key IS NULL
+     LIMIT ?`,
+  )
+  const updateStmt = db.prepare(
+    `UPDATE download_tasks SET dedup_key = ?, search_text = ? WHERE id = ?`,
+  )
+
+  let filled = 0
+  // 每轮至少推进一行，避免任何意外情况下死循环
+  for (let guard = 0; guard < 1_000_000; guard++) {
+    const remaining = maxRows - filled
+    if (remaining <= 0) break
+    const limit = Math.min(chunkSize, remaining)
+    const rows = selectStmt.all(limit) as Array<{
+      id: string
+      title: string
+      artist: string
+      album: string | null
+    }>
+    if (!rows.length) break
+
+    db.transaction((list: typeof rows) => {
+      for (const row of list) {
+        updateStmt.run(
+          buildDedupKey(row.artist, row.title),
+          buildSearchText({ title: row.title, artist: row.artist, album: row.album }),
+          row.id,
+        )
+      }
+    })(rows)
+
+    filled += rows.length
+    if (rows.length < limit) break
+  }
+  return filled
+}
+
+/**
+ * 后台渐进回填：每批之间让出事件循环（`setImmediate`），
+ * 避免大库（10w+ 行）启动期长事务阻塞请求处理。
+ * 返回回填总行数；已全部回填时立即返回 0。
+ */
+export async function backfillTrackKeysInBackground(opts?: {
+  chunkSize?: number
+}): Promise<number> {
+  const chunkSize = opts?.chunkSize ?? BACKFILL_CHUNK_SIZE
+  let total = 0
+  for (let guard = 0; guard < 1_000_000; guard++) {
+    const filled = backfillTrackKeys({ chunkSize, maxRows: chunkSize })
+    total += filled
+    if (filled < chunkSize) break
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  return total
 }
 
 export function getDb() {

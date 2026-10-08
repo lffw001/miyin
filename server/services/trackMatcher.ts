@@ -23,12 +23,10 @@ export type MatchResult = {
   candidates: Array<MatchCandidate & { score: number }>
 }
 
-function norm(s: string) {
-  return (s || '')
-    .toLowerCase()
-    .replace(/\s+/g, '')
-    .replace(/[（(].*?[）)]/g, '')
-}
+import { normalizeForDedup } from '#shared/trackKey'
+
+/** 元数据比对用的归一化：与判重键共用同一实现，避免两套"差不多但不一致"的归一化 */
+const norm = normalizeForDedup
 
 function scoreMeta(track: MatchInput, cand: MatchCandidate) {
   let score = 0

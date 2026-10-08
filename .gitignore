@@ -43,3 +43,7 @@ tools/fnpack.version
 
 # 发版产物（CI 生成并上传 Release，不入库）
 latest.json
+
+# AI 规则
+.cursor/rules/
+.workbuddy/

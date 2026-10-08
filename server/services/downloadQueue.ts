@@ -12,6 +12,7 @@ import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { buildDedupKey, buildSearchText, tokenizeQuery } from '#shared/trackKey'
 import PQueue from 'p-queue'
 import { getDb, checkpointAndShrinkDb } from '../utils/db'
 import { getDownloadDir } from '../utils/paths'
@@ -63,6 +64,8 @@ export type DownloadTaskRow = {
   playlist_url: string | null
   music_info_json: string | null
   file_size: number | null
+  dedup_key: string | null
+  search_text: string | null
   created_at: string
   updated_at: string
 }
@@ -217,9 +220,28 @@ export type ListTasksQuery = {
   tab?: 'running' | 'completed' | 'failed'
   playlistUrl?: string
   batchId?: string
+  /** 关键词检索：多 token AND 匹配 `search_text`（见 shared/trackKey.ts） */
+  q?: string
   page?: number
   pageSize?: number
   limit?: number
+}
+
+/** LIKE 通配符转义；token 归一化已去除标点，此处为防御性处理 */
+function escapeLikePattern(value: string) {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
+/**
+ * 关键词 → `search_text LIKE ?` 子句（多 token AND）。
+ * 多 token AND 使「周杰伦 稻香」与「稻香 周杰伦」结果一致（词序无关）。
+ */
+function buildKeywordClauses(keyword?: string) {
+  const tokens = keyword ? tokenizeQuery(keyword) : []
+  return {
+    sql: tokens.map(() => `search_text LIKE ? ESCAPE '\\'`),
+    params: tokens.map((token) => `%${escapeLikePattern(token)}%`),
+  }
 }
 
 export function listTasks(queryOrStatus?: string | ListTasksQuery) {
@@ -228,47 +250,51 @@ export function listTasks(queryOrStatus?: string | ListTasksQuery) {
       .prepare('SELECT * FROM download_tasks WHERE status = ? ORDER BY created_at DESC')
       .all(queryOrStatus) as DownloadTaskRow[]
   }
-  const q = queryOrStatus || {}
+  const query = queryOrStatus || {}
   const whereClauses: string[] = []
   const params: unknown[] = []
 
-  if (q.tab) {
-    if (q.tab === 'running') {
+  if (query.tab) {
+    if (query.tab === 'running') {
       whereClauses.push(`status IN ('running', 'queued')`)
-    } else if (q.tab === 'completed') {
+    } else if (query.tab === 'completed') {
       whereClauses.push(`status = 'completed'`)
-    } else if (q.tab === 'failed') {
+    } else if (query.tab === 'failed') {
       whereClauses.push(`status IN ('failed', 'cancelled')`)
     }
-  } else if (q.statuses && q.statuses.length > 0) {
-    const placeholders = q.statuses.map(() => '?').join(',')
+  } else if (query.statuses && query.statuses.length > 0) {
+    const placeholders = query.statuses.map(() => '?').join(',')
     whereClauses.push(`status IN (${placeholders})`)
-    params.push(...q.statuses)
-  } else if (q.status) {
+    params.push(...query.statuses)
+  } else if (query.status) {
     whereClauses.push('status = ?')
-    params.push(q.status)
+    params.push(query.status)
   }
 
-  if (q.playlistUrl) {
+  if (query.playlistUrl) {
     whereClauses.push('playlist_url = ?')
-    params.push(q.playlistUrl)
+    params.push(query.playlistUrl)
   }
-  if (q.batchId) {
+  if (query.batchId) {
     whereClauses.push('batch_id = ?')
-    params.push(q.batchId)
+    params.push(query.batchId)
   }
+
+  const keyword = buildKeywordClauses(query.q)
+  whereClauses.push(...keyword.sql)
+  params.push(...keyword.params)
 
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
   let orderBySql = 'ORDER BY created_at DESC'
-  if (q.tab === 'running') {
+  if (query.tab === 'running') {
     // 下载中（running）排在最前，排队中（queued）按入队先后顺序排列
     orderBySql = `ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END ASC, created_at ASC`
-  } else if (q.tab === 'completed') {
+  } else if (query.tab === 'completed') {
     orderBySql = `ORDER BY updated_at DESC, created_at DESC`
   }
 
-  const page = q.page && q.page > 0 ? q.page : undefined
-  const pageSize = q.pageSize && q.pageSize > 0 ? Math.min(q.pageSize, 1000) : undefined
+  const page = query.page && query.page > 0 ? query.page : undefined
+  const pageSize = query.pageSize && query.pageSize > 0 ? Math.min(query.pageSize, 1000) : undefined
 
   if (page && pageSize) {
     const offset = (page - 1) * pageSize
@@ -277,7 +303,7 @@ export function listTasks(queryOrStatus?: string | ListTasksQuery) {
       .all(...params, pageSize, offset) as DownloadTaskRow[]
   }
 
-  const limit = q.limit && q.limit > 0 ? q.limit : 200
+  const limit = query.limit && query.limit > 0 ? query.limit : 200
   return getDb()
     .prepare(`SELECT * FROM download_tasks ${whereSql} ${orderBySql} LIMIT ?`)
     .all(...params, limit) as DownloadTaskRow[]
@@ -292,7 +318,12 @@ export type TaskStats = {
   cancelled: number
 }
 
-export function getTaskStats(filter?: { playlistUrl?: string; batchId?: string }): TaskStats {
+export function getTaskStats(filter?: {
+  playlistUrl?: string
+  batchId?: string
+  /** 必须与 listTasks 使用同一组过滤条件，否则分页 total 失真 */
+  q?: string
+}): TaskStats {
   const whereClauses: string[] = []
   const params: unknown[] = []
 
@@ -304,6 +335,10 @@ export function getTaskStats(filter?: { playlistUrl?: string; batchId?: string }
     whereClauses.push('batch_id = ?')
     params.push(filter.batchId)
   }
+
+  const keyword = buildKeywordClauses(filter?.q)
+  whereClauses.push(...keyword.sql)
+  params.push(...keyword.params)
 
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
   const rows = getDb()
@@ -399,8 +434,9 @@ export function enqueueDownload(input: EnqueueDownloadInput) {
     .prepare(
       `INSERT INTO download_tasks (
         id, title, artist, album, platform, source_id, quality, status, progress,
-        external_id, match_method, batch_id, playlist_url, music_info_json, file_size, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+        external_id, match_method, batch_id, playlist_url, music_info_json, file_size,
+        dedup_key, search_text, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -415,6 +451,8 @@ export function enqueueDownload(input: EnqueueDownloadInput) {
       input.batchId || null,
       input.playlistUrl || null,
       JSON.stringify(musicPayload),
+      buildDedupKey(input.artist, input.title),
+      buildSearchText({ title: input.title, artist: input.artist, album: input.album }),
       ts,
       ts,
     )
@@ -448,8 +486,9 @@ export function batchEnqueueDownload(
   const insertStmt = db.prepare(
     `INSERT INTO download_tasks (
       id, title, artist, album, platform, source_id, quality, status, progress,
-      external_id, match_method, batch_id, playlist_url, music_info_json, file_size, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      external_id, match_method, batch_id, playlist_url, music_info_json, file_size,
+      dedup_key, search_text, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
   )
 
   const enqueuedIds: string[] = []
@@ -495,6 +534,8 @@ export function batchEnqueueDownload(
         item.batchId || null,
         item.playlistUrl || null,
         JSON.stringify(musicPayload),
+        buildDedupKey(item.artist, item.title),
+        buildSearchText({ title: item.title, artist: item.artist, album: item.album }),
         ts,
         ts,
       )

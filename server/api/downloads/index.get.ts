@@ -8,6 +8,8 @@ export default defineEventHandler((event) => {
   const status = typeof query.status === 'string' && query.status.trim() ? query.status.trim() : undefined
   const playlistUrl = typeof query.playlist_url === 'string' && query.playlist_url.trim() ? query.playlist_url.trim() : undefined
   const batchId = typeof query.batch_id === 'string' && query.batch_id.trim() ? query.batch_id.trim() : undefined
+  /** 关键词检索；作用域为当前 tab（由 tab 参数限定） */
+  const q = typeof query.q === 'string' && query.q.trim() ? query.q.trim() : undefined
   const page = query.page != null ? Number(query.page) : undefined
   const pageSize = query.pageSize != null ? Number(query.pageSize) : (query.page_size != null ? Number(query.page_size) : undefined)
   const limit = query.limit != null ? Number(query.limit) : undefined
@@ -17,6 +19,7 @@ export default defineEventHandler((event) => {
     status,
     playlistUrl,
     batchId,
+    q,
     page,
     pageSize,
     limit,
@@ -24,7 +27,8 @@ export default defineEventHandler((event) => {
 
   // 如果带了分页参数，附带统计信息返回
   if (page && pageSize) {
-    const stats = getTaskStats({ playlistUrl, batchId })
+    // 统计必须携带与列表相同的过滤条件，否则 total / totalPages 会按全量计算
+    const stats = getTaskStats({ playlistUrl, batchId, q })
     let total = stats.total
     if (tab === 'running') {
       total = stats.running + stats.queued

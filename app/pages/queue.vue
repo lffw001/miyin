@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import type { SwitchSourceOption } from '~/composables/useSwitchSourcePreference'
+import { matchesTrackKeyword } from '#shared/trackKey'
 
 type Task = {
   id: string
   title: string
   artist: string
+  album?: string | null
   platform: string
   source_id: string | null
   quality: string | null
@@ -35,6 +37,11 @@ const loadingMore = ref(false)
 const hasMore = ref(false)
 const currentPage = ref(1)
 const PAGE_SIZE = 50
+/** 检索框输入值（未防抖） */
+const searchInput = ref('')
+/** 已生效的检索关键词；作用域为当前 tab（服务端配合 tab 参数过滤） */
+const searchKeyword = ref('')
+let searchTimer: ReturnType<typeof setTimeout> | null = null
 const toast = useToast()
 const deleteDialogOpen = ref(false)
 const deleteDialogTitle = ref('确认删除')
@@ -267,6 +274,63 @@ const currentTabTotal = computed(() => {
   return tabCounts.value[tab.value] || 0
 })
 
+const TAB_LABELS = { running: '进行中', completed: '已完成', failed: '失败' } as const
+
+/** 高亮用词元：保留原始大小写与标点，仅做正则转义 */
+const highlightTokens = computed(() =>
+  searchKeyword.value
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean),
+)
+
+/** 把文本切成「命中 / 未命中」片段，供模板渲染 <mark> */
+function highlightSegments(text: string): Array<{ text: string; hit: boolean }> {
+  const tokens = highlightTokens.value
+  if (!tokens.length || !text) return [{ text: text || '', hit: false }]
+  const escaped = tokens
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .sort((a, b) => b.length - a.length)
+  const splitRe = new RegExp(`(${escaped.join('|')})`, 'gi')
+  const testRe = new RegExp(`^(?:${escaped.join('|')})$`, 'i')
+  return text
+    .split(splitRe)
+    .filter((part) => part !== '')
+    .map((part) => ({ text: part, hit: testRe.test(part) }))
+}
+
+/**
+ * SSE 推送的任务是否匹配当前关键词。
+ * 判据抽在 shared/trackKey，与服务端检索严格一致 —— 否则推送会把无关任务插进搜索结果。
+ */
+function matchesKeyword(task: Task) {
+  return matchesTrackKeyword(
+    { title: task.title, artist: task.artist, album: task.album },
+    searchKeyword.value,
+  )
+}
+
+/**
+ * 当前分类无结果时的跨分类提示。
+ * 检索作用域仍是单个 tab（tab 角标随关键词收敛），此处仅消除"默认在「进行中」搜不到东西"的死路。
+ */
+const crossTabHints = computed(() => {
+  if (!searchKeyword.value) return []
+  return (['running', 'completed', 'failed'] as const)
+    .filter((name) => name !== tab.value && tabCounts.value[name] > 0)
+    .map((name) => ({ tab: name, label: TAB_LABELS[name], count: tabCounts.value[name] }))
+})
+
+/** 立即清空检索（跳过 300ms 防抖） */
+function clearSearch() {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  searchInput.value = ''
+  searchKeyword.value = ''
+}
+
 const selectedCount = computed(() => {
   if (selectAllState.value) return currentTabTotal.value
   return selected.value.size
@@ -338,13 +402,19 @@ function downloadListParams(page: number) {
     pageSize: PAGE_SIZE,
   }
   if (batchFilter.value) params.batch_id = batchFilter.value
+  if (searchKeyword.value) params.q = searchKeyword.value
   return params
 }
 
 async function fetchStats() {
   try {
-    const params = batchFilter.value ? { batch_id: batchFilter.value } : undefined
-    const res = await $fetch<ServerStats>('/api/downloads/stats', { params })
+    // 统计与列表使用同一组过滤条件，检索时 tab 角标随之收敛
+    const params: Record<string, string> = {}
+    if (batchFilter.value) params.batch_id = batchFilter.value
+    if (searchKeyword.value) params.q = searchKeyword.value
+    const res = await $fetch<ServerStats>('/api/downloads/stats', {
+      params: Object.keys(params).length ? params : undefined,
+    })
     if (res) serverStats.value = res
   } catch {
     /* ignore */
@@ -435,7 +505,10 @@ function upsert(task: Task) {
 
   const allowed = statusMap[tab.value]
   const belongsToBatch = !batchFilter.value || task.batch_id === batchFilter.value
-  const belongsToTab = !isDeleted && belongsToBatch && allowed.includes(task.status)
+  // 检索态下，推送来的任务也必须命中关键词，否则会污染搜索结果列表
+  const belongsToKeyword = matchesKeyword(task)
+  const belongsToTab =
+    !isDeleted && belongsToBatch && belongsToKeyword && allowed.includes(task.status)
 
   const idx = items.value.findIndex((t) => t.id === task.id)
   if (isDeleted) {
@@ -736,6 +809,19 @@ watch(batchFilter, () => {
   selectAllState.value = false
   void loadTabItems({ reset: true })
 })
+// 输入防抖 300ms 后再触发检索；只 commit 变化过的关键词，避免无谓请求
+watch(searchInput, (value) => {
+  if (searchTimer) clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    searchTimer = null
+    searchKeyword.value = value.trim()
+  }, 300)
+})
+watch(searchKeyword, () => {
+  selected.value = new Set()
+  selectAllState.value = false
+  void loadTabItems({ reset: true })
+})
 const showPageLoading = computed(() => pageLoading.value || loading.value)
 
 onMounted(() => {
@@ -753,6 +839,10 @@ onBeforeUnmount(() => {
   if (statsTimer) {
     clearTimeout(statsTimer)
     statsTimer = null
+  }
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
   }
 })
 onActivated(() => {
@@ -797,6 +887,18 @@ useRegisterPageRefresh(async () => {
         失败
         <span class="tab-count">({{ tabCounts.failed }})</span>
       </button>
+    </div>
+
+    <div class="search-bar">
+      <input
+        v-model="searchInput"
+        class="search-input"
+        type="search"
+        placeholder="检索当前分类：歌手 / 歌名 / 专辑"
+        aria-label="检索下载记录"
+        autocomplete="off"
+      />
+      <button v-if="searchInput" class="link-btn" type="button" @click="clearSearch">清空</button>
     </div>
 
     <p v-if="batchFilter" class="batch-filter-bar">
@@ -879,9 +981,19 @@ useRegisterPageRefresh(async () => {
             <div class="task-main">
               <div class="task-top">
                 <div class="task-title" :title="`${t.title} · ${t.artist}`">
-                  <span class="name">{{ t.title }}</span>
+                  <span class="name">
+                    <template v-for="(seg, i) in highlightSegments(t.title)" :key="`nt${i}`">
+                      <mark v-if="seg.hit">{{ seg.text }}</mark>
+                      <template v-else>{{ seg.text }}</template>
+                    </template>
+                  </span>
                   <span class="sep">·</span>
-                  <span class="artist">{{ t.artist }}</span>
+                  <span class="artist">
+                    <template v-for="(seg, i) in highlightSegments(t.artist)" :key="`na${i}`">
+                      <mark v-if="seg.hit">{{ seg.text }}</mark>
+                      <template v-else>{{ seg.text }}</template>
+                    </template>
+                  </span>
                 </div>
                 <span class="badge" :class="`badge-${t.status}`">{{ statusText(t.status) }}</span>
               </div>
@@ -962,7 +1074,25 @@ useRegisterPageRefresh(async () => {
           </div>
         </template>
       </VirtualList>
-      <p v-else class="muted empty">当前分类没有任务</p>
+      <div v-else class="empty">
+        <p class="muted">
+          {{ searchKeyword ? `没有匹配「${searchKeyword}」的记录` : '当前分类没有任务' }}
+        </p>
+        <template v-if="searchKeyword && crossTabHints.length">
+          <p class="muted hint-line">其他分类中有匹配：</p>
+          <p class="hint-line">
+            <button
+              v-for="h in crossTabHints"
+              :key="h.tab"
+              class="link-btn"
+              type="button"
+              @click="tab = h.tab"
+            >
+              在「{{ h.label }}」中有 {{ h.count }} 条
+            </button>
+          </p>
+        </template>
+      </div>
     </div>
 
     <DeleteConfirmDialog
@@ -1247,8 +1377,48 @@ useRegisterPageRefresh(async () => {
 
 .empty {
   text-align: center;
-  padding: 40px;
+  padding: 40px 16px;
   margin: 0;
+}
+.empty p {
+  margin: 0 0 6px;
+}
+.hint-line {
+  display: flex;
+  gap: 8px 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.search-input::placeholder {
+  color: var(--muted);
+}
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.task-title mark {
+  background: color-mix(in oklab, var(--accent) 26%, transparent);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
 }
 .tip {
   color: var(--accent);
