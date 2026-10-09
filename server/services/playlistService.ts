@@ -6,8 +6,9 @@ import { request as httpRequestPlain } from 'node:http'
 import { URL } from 'node:url'
 import { searchPlatform } from './platformSearch'
 import { matchTrack } from './trackMatcher'
-import { enqueueDownload, batchEnqueueDownload, applyFolderTemplate } from './downloadQueue'
+import { enqueueDownload, batchEnqueueDownload, applyFolderTemplate, type DuplicateAction } from './downloadQueue'
 import { getSettings } from './settingsService'
+import type { DuplicateMatch } from './duplicateGuard'
 import { assertDownloadDirWritable } from '../utils/downloadDir'
 
 export type PlaylistTrackDraft = {
@@ -20,6 +21,8 @@ export type PlaylistTrackDraft = {
   /** 人工确认后可直接带入，跳过搜索匹配 */
   musicInfo?: Record<string, any>
   matchMethod?: string
+  /** 疑似重复的裁决（弹窗逐条结果）；缺省按 duplicatePolicy */
+  duplicateAction?: DuplicateAction
 }
 
 export type PlaylistDraft = {
@@ -1426,7 +1429,16 @@ export async function matchAndEnqueuePlaylist(
 
   const batchId = randomUUID()
   const total = draft.tracks.length
-  const results: Array<{ title: string; ok: boolean; method?: string; error?: string; taskId?: string }> = new Array(total)
+  const results: Array<{
+    title: string
+    ok: boolean
+    method?: string
+    error?: string
+    taskId?: string
+    duplicate?: DuplicateMatch
+    skipped?: boolean
+    replaced?: boolean
+  }> = new Array(total)
   const toEnqueueList: Array<{
     title: string
     artist: string
@@ -1441,6 +1453,7 @@ export async function matchAndEnqueuePlaylist(
     folderPrefix?: string
     batchId?: string
     playlistUrl?: string
+    duplicateAction?: DuplicateAction
     resultIndex: number
   }> = []
 
@@ -1568,6 +1581,7 @@ export async function matchAndEnqueuePlaylist(
         folderPrefix,
         batchId,
         playlistUrl: draft.url,
+        duplicateAction: track.duplicateAction,
         resultIndex: index,
       })
       finishedCount++
@@ -1620,6 +1634,9 @@ export async function matchAndEnqueuePlaylist(
       const res = results[item.resultIndex]
       const br = batch.results[j]
       if (!res) continue
+      res.duplicate = br?.duplicate
+      res.skipped = br?.skipped
+      res.replaced = br?.replaced
       if (br?.ok && br.id) {
         res.taskId = br.id
       } else {
@@ -1635,6 +1652,8 @@ export async function matchAndEnqueuePlaylist(
     playlistTitle: draft.title,
     total: draft.tracks.length,
     enqueued: finalResults.filter((r) => r.ok).length,
+    skipped: finalResults.filter((r) => r.skipped).length,
+    replaced: finalResults.filter((r) => r.replaced).length,
     results: finalResults,
   }
 }

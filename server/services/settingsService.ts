@@ -20,6 +20,17 @@ export const AppSettingsSchema = z.object({
   albumFolderTemplate: z.string().min(1).default('{album}'),
   autoFailover: z.boolean().default(true),
   maxAttempts: z.number().int().min(1).max(8).default(3),
+  /** 入队判重总开关；关闭后行为回到未引入判重的版本 */
+  duplicateCheckEnabled: z.boolean().default(true),
+  /**
+   * 疑似重复的处理策略：
+   * - `prompt` 每次询问（弹窗「全部替换 / 全部跳过 / 逐条」）
+   * - `skip` 自动跳过（弹窗「不再提醒」即写入此值）
+   * - `replace` 自动替换
+   */
+  duplicatePolicy: z.enum(['prompt', 'skip', 'replace']).default('prompt'),
+  /** 低音质覆盖高音质默认拦截（④A） */
+  duplicateProtectQuality: z.boolean().default(true),
 })
 
 export type AppSettings = z.infer<typeof AppSettingsSchema>
@@ -63,6 +74,9 @@ const DEFAULTS: AppSettings = {
   albumFolderTemplate: '{album}',
   autoFailover: true,
   maxAttempts: 3,
+  duplicateCheckEnabled: true,
+  duplicatePolicy: 'prompt',
+  duplicateProtectQuality: true,
 }
 
 export function getSettings(): AppSettings {

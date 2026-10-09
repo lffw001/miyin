@@ -6,10 +6,15 @@ import {
   type DownloadQuality,
 } from '~/utils/mediaLabels'
 import { searchPageHasMore } from '#shared/searchPagination'
+import { buildDedupKey } from '#shared/trackKey'
 import type { EnqueueResultPayload } from '~/components/EnqueueResultDialog.vue'
 import type { AlbumDetailData } from '~/components/AlbumDetailPanel.vue'
 import type { SearchAlbumItem } from '~/components/AlbumResultList.vue'
 import type { SearchTrack } from '~/components/SongResultList.vue'
+import type {
+  DuplicateDecision,
+  DuplicateReviewItem,
+} from '~/components/DuplicateReviewDialog.vue'
 
 type PlatformTab = {
   id: string
@@ -61,6 +66,146 @@ const showEnqueueResult = ref(false)
 const enqueueOrigin = ref<'album' | 'song'>('album')
 /** 上一次单曲批量提交的曲目，用于按 results 下标重试失败项 */
 const lastSongBatch = ref<SearchTrack[]>([])
+
+/**
+ * 疑似重复预检弹窗（①A）。用户取消时 resolve(null)，调用方需中止本次入队。
+ */
+const dupDialogOpen = ref(false)
+const dupItems = ref<DuplicateReviewItem[]>([])
+let dupResolver: ((decisions: Map<number, DuplicateDecision> | null) => void) | null = null
+/** 搜索结果页「已在库」徽标（C3）：命中曲目的 dedupKey 集合 */
+const libraryKeys = ref<Set<string>>(new Set())
+/** 专辑详情页「已在库」徽标（曲目来源不同，需独立预检） */
+const albumLibraryKeys = ref<Set<string>>(new Set())
+let libraryKeysTimer: ReturnType<typeof setTimeout> | null = null
+
+function onDupConfirm(decisions: Map<number, DuplicateDecision>) {
+  dupDialogOpen.value = false
+  dupResolver?.(decisions)
+  dupResolver = null
+}
+
+function onDupCancel() {
+  dupDialogOpen.value = false
+  dupResolver?.(null)
+  dupResolver = null
+}
+
+/** 「不再提醒」→ 写入 skip 策略（设置页可改回） */
+async function onDupMute() {
+  try {
+    await $fetch('/api/settings', { method: 'PUT', body: { duplicatePolicy: 'skip' } })
+    toast.info('已设为自动跳过重复项，可在设置中改回')
+  } catch {
+    /* 静默：不影响本次裁决 */
+  }
+}
+
+/**
+ * 入队前预检：无重复返回空 Map 直接入队；用户取消返回 `null` 中止。
+ * 预检本身失败时不阻断下载（交回服务端按策略处理）。
+ */
+async function checkDuplicates(
+  rows: Array<{ title: string; artist: string; album?: string | null }>,
+): Promise<Map<number, DuplicateDecision> | null> {
+  try {
+    const res = await $fetch<{ duplicates: DuplicateReviewItem[] }>(
+      '/api/downloads/duplicate-check',
+      {
+        method: 'POST',
+        body: {
+          items: rows.map((r) => ({
+            title: r.title,
+            artist: r.artist,
+            album: r.album ?? null,
+            quality: quality.value,
+          })),
+        },
+      },
+    )
+    if (!res.duplicates.length) return new Map()
+    dupItems.value = res.duplicates
+    dupDialogOpen.value = true
+    return await new Promise<Map<number, DuplicateDecision> | null>((resolve) => {
+      dupResolver = resolve
+    })
+  } catch {
+    return new Map()
+  }
+}
+
+/** 记录本次提交每条的裁决，供逐条回填 */
+function actionFor(decisions: Map<number, DuplicateDecision>, index: number) {
+  return decisions.get(index)
+}
+
+/** 刷新「已在库」徽标（上限 200 条已加载项，避免请求体过大） */
+async function refreshLibraryKeys() {
+  const tracks = items.value.slice(0, 200)
+  if (!tracks.length) {
+    libraryKeys.value = new Set()
+    return
+  }
+  try {
+    const res = await $fetch<{ duplicates: Array<{ dedupKey: string }> }>(
+      '/api/downloads/duplicate-check',
+      {
+        method: 'POST',
+        body: {
+          items: tracks.map((t) => ({ title: t.title, artist: t.artist, album: t.album })),
+        },
+      },
+    )
+    libraryKeys.value = new Set(res.duplicates.map((d) => d.dedupKey))
+  } catch {
+    /* 徽标属增强信息，失败静默 */
+  }
+}
+
+watch(items, () => {
+  if (libraryKeysTimer) clearTimeout(libraryKeysTimer)
+  libraryKeysTimer = setTimeout(() => {
+    libraryKeysTimer = null
+    void refreshLibraryKeys()
+  }, 300)
+})
+
+/** 专辑曲目「已在库」预检（与搜索结果各自成集，避免互相干扰） */
+async function refreshAlbumLibraryKeys() {
+  const tracks = (albumDetail.value?.tracks || []).slice(0, 200)
+  if (!tracks.length) {
+    albumLibraryKeys.value = new Set()
+    return
+  }
+  try {
+    const res = await $fetch<{ duplicates: Array<{ dedupKey: string }> }>(
+      '/api/downloads/duplicate-check',
+      {
+        method: 'POST',
+        body: { items: tracks.map((t) => ({ title: t.title, artist: t.artist, album: t.album })) },
+      },
+    )
+    albumLibraryKeys.value = new Set(res.duplicates.map((d) => d.dedupKey))
+  } catch {
+    /* 徽标属增强信息，失败静默 */
+  }
+}
+
+watch(albumDetail, () => {
+  void refreshAlbumLibraryKeys()
+})
+
+onBeforeUnmount(() => {
+  if (libraryKeysTimer) {
+    clearTimeout(libraryKeysTimer)
+    libraryKeysTimer = null
+  }
+  if (albumFolderSaveTimer) {
+    clearTimeout(albumFolderSaveTimer)
+    albumFolderSaveTimer = null
+  }
+  previewAbort?.abort()
+})
 const {
   showHomeBanner,
   refresh: refreshFnOsAuth,
@@ -406,25 +551,39 @@ watch(current, (track) => {
 
 async function download() {
   if (!selected.value || downloading.value) return
+  const track = selected.value
   downloading.value = true
   try {
-    await $fetch('/api/downloads', {
-      method: 'POST',
-      body: {
-        title: selected.value.title,
-        artist: selected.value.artist,
-        album: selected.value.album,
-        platform: selected.value.platform,
-        quality: quality.value,
-        musicInfo: selected.value.musicInfo,
-        externalId: selected.value.externalId,
-        matchMethod: 'id',
-        downloadLyric: withLyric.value,
-        lyricMode: lyricMode.value,
+    // ①A：入队前预检，有疑似重复先弹窗裁决；用户取消则中止
+    const decisions = await checkDuplicates([
+      { title: track.title, artist: track.artist, album: track.album },
+    ])
+    if (decisions === null) return
+
+    const outcome = await $fetch<{ kind: 'enqueued' | 'replaced' | 'skipped' }>(
+      '/api/downloads',
+      {
+        method: 'POST',
+        body: {
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          platform: track.platform,
+          quality: quality.value,
+          musicInfo: track.musicInfo,
+          externalId: track.externalId,
+          matchMethod: 'id',
+          downloadLyric: withLyric.value,
+          lyricMode: lyricMode.value,
+          duplicateAction: actionFor(decisions, 0),
+        },
       },
-    })
-    toast.success('已加入下载队列')
+    )
+    if (outcome.kind === 'skipped') toast.info('已在库中，已跳过')
+    else if (outcome.kind === 'replaced') toast.success('已替换并重新入队')
+    else toast.success('已加入下载队列')
     useDownloadBadge().notifyChanged()
+    void refreshLibraryKeys()
     if (detailSheetOpen.value) {
       await new Promise((r) => setTimeout(r, 350))
       closeDetailSheet()
@@ -450,13 +609,19 @@ async function enqueueAlbumTracks(indices: number[]) {
   loading.value = true
   try {
     const { album } = albumDetail.value
+    // ①A：先预检，重复项交给聚合弹窗裁决
+    const decisions = await checkDuplicates(
+      tracks.map((t) => ({ title: t.title, artist: t.artist, album: t.album || album.title })),
+    )
+    if (decisions === null) return
+
     const res = await $fetch<EnqueueResultPayload>('/api/playlist/enqueue', {
       method: 'POST',
       body: {
         title: album.title,
         platform: album.platform,
         url: `album://${album.platform}/${album.externalId}`,
-        tracks: tracks.map((t) => ({
+        tracks: tracks.map((t, i) => ({
           externalId: t.externalId,
           title: t.title,
           artist: t.artist,
@@ -465,6 +630,7 @@ async function enqueueAlbumTracks(indices: number[]) {
           platform: t.platform,
           musicInfo: t.musicInfo,
           matchMethod: 'id',
+          duplicateAction: actionFor(decisions, i),
         })),
         downloadLyric: withLyric.value,
         lyricMode: lyricMode.value,
@@ -478,6 +644,8 @@ async function enqueueAlbumTracks(indices: number[]) {
     enqueueOrigin.value = 'album'
     showEnqueueResult.value = true
     useDownloadBadge().notifyChanged()
+    void refreshLibraryKeys()
+    void refreshAlbumLibraryKeys()
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '入队失败'))
   } finally {
@@ -496,13 +664,19 @@ async function enqueueSelectedSongs(tracks: SearchTrack[]) {
   loadingText.value = '入队中…'
   loading.value = true
   try {
+    // ①A：先预检，重复项交给聚合弹窗裁决
+    const decisions = await checkDuplicates(
+      tracks.map((t) => ({ title: t.title, artist: t.artist, album: t.album })),
+    )
+    if (decisions === null) return
+
     const res = await $fetch<EnqueueResultPayload>('/api/playlist/enqueue', {
       method: 'POST',
       body: {
         title: '批量下载',
         platform: platform.value,
         url: '',
-        tracks: tracks.map((t) => ({
+        tracks: tracks.map((t, i) => ({
           externalId: t.externalId,
           title: t.title,
           artist: t.artist,
@@ -511,6 +685,7 @@ async function enqueueSelectedSongs(tracks: SearchTrack[]) {
           platform: t.platform,
           musicInfo: t.musicInfo,
           matchMethod: 'id',
+          duplicateAction: actionFor(decisions, i),
         })),
         downloadLyric: withLyric.value,
         lyricMode: lyricMode.value,
@@ -522,6 +697,7 @@ async function enqueueSelectedSongs(tracks: SearchTrack[]) {
     enqueueResult.value = res
     showEnqueueResult.value = true
     useDownloadBadge().notifyChanged()
+    void refreshLibraryKeys()
   } catch (e: unknown) {
     toast.error(apiErrorMessage(e, '入队失败'))
   } finally {
@@ -580,6 +756,14 @@ async function retryFailedEnqueue() {
       continue-label="继续搜索"
       @close="showEnqueueResult = false"
       @retry-failed="retryFailedEnqueue"
+    />
+
+    <DuplicateReviewDialog
+      v-model:open="dupDialogOpen"
+      :items="dupItems"
+      @confirm="onDupConfirm"
+      @cancel="onDupCancel"
+      @mute="onDupMute"
     />
 
     <div class="search-bar">
@@ -643,6 +827,7 @@ async function retryFailedEnqueue() {
         :album-download-to-folder="albumDownloadToFolder"
         :album-folder-template="albumFolderTemplate"
         :show-back="true"
+        :library-keys="albumLibraryKeys"
         @back="resetAlbumView"
         @enqueue="enqueueAlbumTracks"
         @update:quality="quality = $event"
@@ -664,6 +849,7 @@ async function retryFailedEnqueue() {
             :has-more="hasMore"
             :loading-more="loadingMore || loading"
             :enqueueing="downloading"
+            :library-keys="libraryKeys"
             @select="selectTrack"
             @enqueue="enqueueSelectedSongs"
             @load-more="loadMore"
@@ -734,6 +920,7 @@ async function retryFailedEnqueue() {
             :album-download-to-folder="albumDownloadToFolder"
             :album-folder-template="albumFolderTemplate"
             :show-back="false"
+            :library-keys="albumLibraryKeys"
             @enqueue="enqueueAlbumTracks"
             @update:quality="quality = $event"
             @update:with-lyric="withLyric = $event"

@@ -21,13 +21,16 @@ import {
   ensureDownloadDirWritable,
   isDownloadPermissionError,
 } from '../utils/downloadDir'
-import { getSettings } from './settingsService'
+import { getSettings, type AppSettings } from './settingsService'
+import { findDuplicates, type DuplicateMatch } from './duplicateGuard'
 import { listEnabledOkSources } from './sourceRegistry'
-import { isHighestQuality, resolveMusicUrl } from './musicUrlResolve'
+import { isHighestQuality, listMusicUrlCandidates } from './musicUrlResolve'
+import { recordSourceOutcome } from './sourceStats'
 import { fetchLyric } from './lyricService'
 import { writeAudioMetadata } from './metadataService'
-import { sniffAudioExt } from '../utils/audioSniff'
+import { sniffAudioExt, isLosslessClaimMismatch } from '../utils/audioSniff'
 import {
+  allPreviewError,
   expectedDurationFromMusicInfo,
   isLikelyPreviewByAbsoluteDuration,
   isLikelyPreviewClip,
@@ -35,13 +38,18 @@ import {
   minFullTrackBytes,
   previewClipError,
   previewSizeError,
-  previewUrlError,
   probeAudioDurationSeconds,
+  probeCandidate,
+  type CandidateVerdict,
 } from '../utils/audioPreview'
+import { qualityFromBitrate } from '#shared/quality'
 import { nextStatusAfterFailure, isRetryableError, isAllowedQuality } from './downloadState'
 import { msUntilCanStartTask } from '../utils/downloadIntervals'
 export type { TaskStatus } from './downloadState'
 export { nextStatusAfterFailure, isRetryableError } from './downloadState'
+
+/** 疑似重复的裁决：跳过 / 替换既有记录 / 强制入队（接受覆盖） */
+export type DuplicateAction = 'skip' | 'replace' | 'enqueue'
 
 export type DownloadTaskRow = {
   id: string
@@ -214,14 +222,30 @@ function ensureParentDir(filePath: string) {
   mkdirSync(dirname(filePath), { recursive: true })
 }
 
+/**
+ * 下载临时文件标记。所有下载先落 `<name>.part.<ext>`，校验通过后再原子 rename 到最终路径。
+ *
+ * 放在扩展名**之前**（`.part.flac` 而非 `.flac.part`），保证 ffprobe / ffmpeg
+ * 按扩展名推断格式时仍看到真实扩展名。
+ */
+const TEMP_SUFFIX = '.part'
+
 export type ListTasksQuery = {
   status?: string
   statuses?: string[]
   tab?: 'running' | 'completed' | 'failed'
   playlistUrl?: string
   batchId?: string
-  /** 关键词检索：多 token AND 匹配 `search_text`（见 shared/trackKey.ts） */
+/** 关键词检索：多 token AND 匹配 `search_text`（见 shared/trackKey.ts） */
   q?: string
+  /** 平台过滤（wy / tx / kg …） */
+  platform?: string
+  /** 音质过滤；取值来自 shared/quality.QUALITY_LADDER（含 192k） */
+  quality?: string
+  /** 入队日期下界（含），YYYY-MM-DD */
+  since?: string
+  /** 入队日期上界（含），YYYY-MM-DD */
+  until?: string
   page?: number
   pageSize?: number
   limit?: number
@@ -242,6 +266,50 @@ function buildKeywordClauses(keyword?: string) {
     sql: tokens.map(() => `search_text LIKE ? ESCAPE '\\'`),
     params: tokens.map((token) => `%${escapeLikePattern(token)}%`),
   }
+}
+
+/** `YYYY-MM-DD` → 次日（用于把「含当天」的闭区间转成开区间上界） */
+function nextDayOf(date: string): string | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!m) return null
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1))
+  return d.toISOString().slice(0, 10)
+}
+
+/**
+ * 平台 / 音质 / 入队日期 过滤。
+ * **列表与统计必须共用**，否则带筛选时分页 `total` 会按全量算（同 P0 的陷阱 1）。
+ */
+function buildMetaClauses(filter?: {
+  platform?: string
+  quality?: string
+  since?: string
+  until?: string
+}) {
+  const sql: string[] = []
+  const params: unknown[] = []
+  if (filter?.platform) {
+    sql.push('platform = ?')
+    params.push(filter.platform)
+  }
+  if (filter?.quality) {
+    sql.push('quality = ?')
+    params.push(filter.quality)
+  }
+  // created_at 是 ISO(UTC) 字符串，按字典序比较即等价于按时间比较。
+  // 非法日期一律忽略：宁可不过滤，也不要静默筛成空列表
+  if (filter?.since && /^\d{4}-\d{2}-\d{2}$/.test(filter.since)) {
+    sql.push('created_at >= ?')
+    params.push(filter.since)
+  }
+  if (filter?.until) {
+    const next = nextDayOf(filter.until)
+    if (next) {
+      sql.push('created_at < ?')
+      params.push(next)
+    }
+  }
+  return { sql, params }
 }
 
 export function listTasks(queryOrStatus?: string | ListTasksQuery) {
@@ -284,6 +352,10 @@ export function listTasks(queryOrStatus?: string | ListTasksQuery) {
   whereClauses.push(...keyword.sql)
   params.push(...keyword.params)
 
+  const meta = buildMetaClauses(query)
+  whereClauses.push(...meta.sql)
+  params.push(...meta.params)
+
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
   let orderBySql = 'ORDER BY created_at DESC'
   if (query.tab === 'running') {
@@ -323,6 +395,10 @@ export function getTaskStats(filter?: {
   batchId?: string
   /** 必须与 listTasks 使用同一组过滤条件，否则分页 total 失真 */
   q?: string
+  platform?: string
+  quality?: string
+  since?: string
+  until?: string
 }): TaskStats {
   const whereClauses: string[] = []
   const params: unknown[] = []
@@ -339,6 +415,10 @@ export function getTaskStats(filter?: {
   const keyword = buildKeywordClauses(filter?.q)
   whereClauses.push(...keyword.sql)
   params.push(...keyword.params)
+
+  const meta = buildMetaClauses(filter)
+  whereClauses.push(...meta.sql)
+  params.push(...meta.params)
 
   const whereSql = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : ''
   const rows = getDb()
@@ -390,6 +470,27 @@ function removeTaskFiles(task: DownloadTaskRow) {
   removeFileQuiet(task.lyric_path)
 }
 
+/**
+ * 替换任务（⑦A）成功后的旧文件清理。
+ *
+ * 被替换的任务在 `music_info_json` 里记了旧路径 —— 因为替换是 **UPDATE 同一行**，
+ * 新的 `file_path` 会覆盖旧值，不主动清理就会留下孤儿文件（R-d）。
+ */
+function cleanupReplacedFiles(task: DownloadTaskRow) {
+  let musicInfo: Record<string, unknown> = {}
+  try {
+    musicInfo = JSON.parse(task.music_info_json || '{}')
+  } catch {
+    musicInfo = {}
+  }
+  const current = getTask(task.id)
+  const oldFile = typeof musicInfo.__replaceOldFile === 'string' ? musicInfo.__replaceOldFile : null
+  const oldLyric = typeof musicInfo.__replaceOldLyric === 'string' ? musicInfo.__replaceOldLyric : null
+  // 新旧路径相同时 rename 已经就地覆盖，不能误删
+  if (oldFile && oldFile !== current?.file_path) removeFileQuiet(oldFile)
+  if (oldLyric && oldLyric !== current?.lyric_path) removeFileQuiet(oldLyric)
+}
+
 export type EnqueueDownloadInput = {
   title: string
   artist: string
@@ -406,30 +507,49 @@ export type EnqueueDownloadInput = {
   folderPrefix?: string
   batchId?: string
   playlistUrl?: string
+  /** 疑似重复时的裁决；缺省按 `duplicatePolicy`，`prompt` 下服务端回落 `skip`（D3） */
+  duplicateAction?: DuplicateAction
 }
 
-export function enqueueDownload(input: EnqueueDownloadInput) {
+export type EnqueueOutcome =
+  | { kind: 'enqueued'; task: DownloadTaskRow }
+  | { kind: 'replaced'; task: DownloadTaskRow; replacedFrom: string }
+  | { kind: 'skipped'; duplicate: DuplicateMatch }
+
+type PreparedEnqueue = {
+  id: string
+  ts: string
+  sourceId: string
+  quality: string
+  musicPayload: Record<string, unknown>
+}
+
+/** 校验 + 解析音源。放在事务外：不涉及写入，抛错时无需回滚 */
+function prepareEnqueue(input: EnqueueDownloadInput, settings: AppSettings): PreparedEnqueue {
   if (input.quality != null && input.quality !== '' && !isAllowedQuality(input.quality)) {
     throw createError({ statusCode: 400, statusMessage: `不支持的音质: ${input.quality}` })
   }
-  const settings = getSettings()
-  assertDownloadDirWritable(settings.downloadDir)
-
-  const id = randomUUID()
-  const ts = nowIso()
   const sources = listEnabledOkSources(input.platform)
   const sourceId = input.sourceId || sources[0]?.id
   if (!sourceId) {
     throw createError({ statusCode: 400, statusMessage: `没有可用音源支持平台 ${input.platform}` })
   }
-
-  const musicPayload = {
-    ...input.musicInfo,
-    __downloadLyric: input.downloadLyric ?? settings.downloadLyric,
-    __lyricMode: input.lyricMode ?? settings.lyricMode,
-    ...(input.folderPrefix ? { __folderPrefix: input.folderPrefix } : {}),
+  return {
+    id: randomUUID(),
+    ts: nowIso(),
+    sourceId,
+    quality: input.quality || settings.defaultQuality,
+    musicPayload: {
+      ...input.musicInfo,
+      __downloadLyric: input.downloadLyric ?? settings.downloadLyric,
+      __lyricMode: input.lyricMode ?? settings.lyricMode,
+      ...(input.folderPrefix ? { __folderPrefix: input.folderPrefix } : {}),
+    },
   }
+}
 
+/** 纯写入：不 emit、不 kick，便于被包进事务 */
+function insertTaskRow(input: EnqueueDownloadInput, prepared: PreparedEnqueue) {
   getDb()
     .prepare(
       `INSERT INTO download_tasks (
@@ -439,36 +559,206 @@ export function enqueueDownload(input: EnqueueDownloadInput) {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
     )
     .run(
-      id,
+      prepared.id,
       input.title,
       input.artist,
       input.album || null,
       input.platform,
-      sourceId,
-      input.quality || settings.defaultQuality,
+      prepared.sourceId,
+      prepared.quality,
       input.externalId || null,
       input.matchMethod || 'id',
       input.batchId || null,
       input.playlistUrl || null,
+      JSON.stringify(prepared.musicPayload),
+      buildDedupKey(input.artist, input.title),
+      buildSearchText({ title: input.title, artist: input.artist, album: input.album }),
+      prepared.ts,
+      prepared.ts,
+    )
+}
+
+/**
+ * 无条件入队（**语义保持不变**）。
+ *
+ * 等价于用户显式选择「入队 / 接受覆盖」—— 不做判重。判重走 `enqueueDownloadChecked`。
+ */
+export function enqueueDownload(input: EnqueueDownloadInput) {
+  const settings = getSettings()
+  assertDownloadDirWritable(settings.downloadDir)
+  const prepared = prepareEnqueue(input, settings)
+  insertTaskRow(input, prepared)
+  emitTask(prepared.id)
+  kickWorker()
+  return getTask(prepared.id)!
+}
+
+/**
+ * 裁决优先级：显式传入 > `input.duplicateAction` > 设置策略。
+ * `prompt` 且未给裁决时回落 `skip` —— **服务端不得静默覆盖**（D3）。
+ */
+export function resolveDuplicateAction(
+  input: { duplicateAction?: DuplicateAction },
+  override: DuplicateAction | undefined,
+  settings: AppSettings,
+): DuplicateAction {
+  const explicit = override ?? input.duplicateAction
+  if (explicit) return explicit
+  return settings.duplicatePolicy === 'replace' ? 'replace' : 'skip'
+}
+
+function duplicateCandidateOf(input: EnqueueDownloadInput, settings: AppSettings) {
+  return {
+    title: input.title,
+    artist: input.artist,
+    album: input.album,
+    quality: input.quality || settings.defaultQuality,
+  }
+}
+
+/** 替换：**UPDATE 既有行**（复用同一 task id），记下旧路径待新文件落地后清理（R-d） */
+function updateRowForReplace(
+  taskId: string,
+  input: EnqueueDownloadInput,
+  prepared: PreparedEnqueue,
+  settings: AppSettings,
+) {
+  const existing = getTask(taskId)
+  if (!existing) throw createError({ statusCode: 404, statusMessage: '替换目标不存在' })
+
+  const musicPayload = {
+    ...prepared.musicPayload,
+    ...(existing.file_path ? { __replaceOldFile: existing.file_path } : {}),
+    ...(existing.lyric_path ? { __replaceOldLyric: existing.lyric_path } : {}),
+  }
+
+  getDb()
+    .prepare(
+      `UPDATE download_tasks SET
+         title = ?, artist = ?, album = ?, platform = ?, source_id = ?, quality = ?,
+         status = 'queued', progress = 0, error = NULL, attempts = 0,
+         external_id = ?, match_method = ?, music_info_json = ?,
+         dedup_key = ?, search_text = ?,
+         file_path = NULL, lyric_path = NULL, file_size = NULL,
+         updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(
+      input.title,
+      input.artist,
+      input.album || null,
+      input.platform,
+      prepared.sourceId,
+      input.quality || settings.defaultQuality,
+      input.externalId || null,
+      input.matchMethod || 'id',
       JSON.stringify(musicPayload),
       buildDedupKey(input.artist, input.title),
       buildSearchText({ title: input.title, artist: input.artist, album: input.album }),
-      ts,
-      ts,
+      prepared.ts,
+      taskId,
     )
-  emitTask(id)
+}
+
+/**
+ * 带判重的单曲入队。
+ *
+ * 判重查询与写入放在**同一事务**内（D4）：better-sqlite3 同步执行，
+ * 并发的另一次入队只能落在本事务之前（被检出）或之后（会检出本次），没有中间窗口。
+ */
+export function enqueueDownloadChecked(
+  input: EnqueueDownloadInput,
+  opts?: { action?: DuplicateAction },
+): EnqueueOutcome {
+  const settings = getSettings()
+  assertDownloadDirWritable(settings.downloadDir)
+  const prepared = prepareEnqueue(input, settings)
+  const action = resolveDuplicateAction(input, opts?.action, settings)
+
+  if (!settings.duplicateCheckEnabled || action === 'enqueue') {
+    insertTaskRow(input, prepared)
+    emitTask(prepared.id)
+    kickWorker()
+    return { kind: 'enqueued', task: getTask(prepared.id)! }
+  }
+
+  const decision = getDb().transaction(() => {
+    const hit = findDuplicates([duplicateCandidateOf(input, settings)]).get(
+      buildDedupKey(input.artist, input.title),
+    )
+    if (!hit) {
+      insertTaskRow(input, prepared)
+      return { kind: 'enqueued' as const }
+    }
+    if (action === 'skip') {
+      return { kind: 'skipped' as const, duplicate: hit }
+    }
+    // ④A：即便策略是「自动替换」，低音质覆盖高音质也必须拦下来 ——
+    // 否则 duplicatePolicy='replace' 会把音质保护整个绕过
+    if (hit.qualityInverted) {
+      return { kind: 'skipped' as const, duplicate: hit }
+    }
+    const replacedFrom = hit.existing!.id
+    updateRowForReplace(replacedFrom, input, prepared, settings)
+    return { kind: 'replaced' as const, replacedFrom }
+  })()
+
+  if (decision.kind === 'enqueued') {
+    emitTask(prepared.id)
+    kickWorker()
+    return { kind: 'enqueued', task: getTask(prepared.id)! }
+  }
+  if (decision.kind === 'skipped') {
+    return { kind: 'skipped', duplicate: decision.duplicate }
+  }
+  emitTask(decision.replacedFrom)
   kickWorker()
-  return getTask(id)!
+  return {
+    kind: 'replaced',
+    task: getTask(decision.replacedFrom)!,
+    replacedFrom: decision.replacedFrom,
+  }
 }
 
 /**
  * 批量任务入库：使用 SQLite 事务进行高效分批写入，避免循环单个 insert 导致的 WAL 和事件广播压力。
  */
+export type BatchEnqueueItemResult = {
+  ok: boolean
+  id?: string
+  error?: string
+  /** 疑似重复命中的信息；`skipped` / `replaced` 时存在 */
+  duplicate?: DuplicateMatch
+  /** 本次因疑似重复被跳过（不入库） */
+  skipped?: boolean
+  /** 本次更新了既有记录并重新下载 */
+  replaced?: boolean
+}
+
+export type BatchEnqueueResult = {
+  total: number
+  enqueued: number
+  skipped: number
+  replaced: number
+  ids: string[]
+  results: BatchEnqueueItemResult[]
+}
+
+/**
+ * 批量任务入库：分块事务写入 + 判重。
+ *
+ * 每个分块内部把「判重查询 + 写入」放进**同一个事务**（D4）：
+ * - 保证原子性（并发的另一次入队不会插进查询与写入之间）
+ * - 每块只发 1 次判重查询，不产生 N+1
+ * - 保留原有 `CHUNK_SIZE` 分块以约束单事务锁占用与 WAL 峰值
+ */
 export function batchEnqueueDownload(
   items: EnqueueDownloadInput[],
   opts?: { silent?: boolean },
-): { total: number; enqueued: number; ids: string[] } {
-  if (!items.length) return { total: 0, enqueued: 0, ids: [], results: [] }
+): BatchEnqueueResult {
+  if (!items.length) {
+    return { total: 0, enqueued: 0, skipped: 0, replaced: 0, ids: [], results: [] }
+  }
 
   const settings = getSettings()
   assertDownloadDirWritable(settings.downloadDir)
@@ -483,87 +773,166 @@ export function batchEnqueueDownload(
     return sid
   }
 
-  const insertStmt = db.prepare(
-    `INSERT INTO download_tasks (
-      id, title, artist, album, platform, source_id, quality, status, progress,
-      external_id, match_method, batch_id, playlist_url, music_info_json, file_size,
-      dedup_key, search_text, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
-  )
+  const checkDup = settings.duplicateCheckEnabled
+  /** 批内自去重：同批次相同 dedupKey 只处理首个（否则本批次会自己撞自己） */
+  const batchSeen = new Set<string>()
 
   const enqueuedIds: string[] = []
-  const itemResults: Array<{ ok: boolean; id?: string; error?: string }> = []
+  const replacedIds: string[] = []
+  const itemResults: BatchEnqueueItemResult[] = new Array(items.length)
   const ts = nowIso()
 
-  const runInsertTransaction = db.transaction((taskList: EnqueueDownloadInput[]) => {
-    for (const item of taskList) {
+  const runChunkTransaction = db.transaction((indices: number[]) => {
+    // 本分块的 DB 判重结果（同事务内查询，见 D4）
+    const dbHits = new Map<number, DuplicateMatch>()
+    if (checkDup) {
+      const pending = indices.filter((index) => {
+        const item = items[index]!
+        const key = buildDedupKey(item.artist, item.title)
+        return key !== '' && !batchSeen.has(key)
+      })
+      const hits = findDuplicates(pending.map((index) => duplicateCandidateOf(items[index]!, settings)))
+      for (const index of pending) {
+        const item = items[index]!
+        const hit = hits.get(buildDedupKey(item.artist, item.title))
+        if (hit) dbHits.set(index, hit)
+      }
+    }
+
+    for (const index of indices) {
+      const item = items[index]!
       if (item.quality != null && item.quality !== '' && !isAllowedQuality(item.quality)) {
-        itemResults.push({
-          ok: false,
-          error: `不支持的音质: ${item.quality}`,
-        })
+        itemResults[index] = { ok: false, error: `不支持的音质: ${item.quality}` }
         continue
       }
+
+      const key = buildDedupKey(item.artist, item.title)
+
+      // 1) 批内自去重优先：同批次已处理过同 key → 直接跳过（否则本批次会自己撞自己）
+      if (checkDup && key && batchSeen.has(key)) {
+        itemResults[index] = {
+          ok: false,
+          skipped: true,
+          error: '本批次内重复，已跳过',
+          duplicate: { dedupKey: key, reason: 'batch', qualityInverted: false, existing: null },
+        }
+        continue
+      }
+      if (checkDup && key) batchSeen.add(key)
+
       const sourceId = item.sourceId || getSourceForPlatform(item.platform)
       if (!sourceId) {
-        itemResults.push({
-          ok: false,
-          error: `没有可用音源支持平台 ${item.platform}`,
-        })
+        itemResults[index] = { ok: false, error: `没有可用音源支持平台 ${item.platform}` }
         continue
       }
 
-      const id = randomUUID()
-      const musicPayload = {
-        ...item.musicInfo,
-        __downloadLyric: item.downloadLyric ?? settings.downloadLyric,
-        __lyricMode: item.lyricMode ?? settings.lyricMode,
-        ...(item.folderPrefix ? { __folderPrefix: item.folderPrefix } : {}),
+      const prepared: PreparedEnqueue = {
+        id: randomUUID(),
+        ts,
+        sourceId,
+        quality: item.quality || settings.defaultQuality,
+        musicPayload: {
+          ...item.musicInfo,
+          __downloadLyric: item.downloadLyric ?? settings.downloadLyric,
+          __lyricMode: item.lyricMode ?? settings.lyricMode,
+          ...(item.folderPrefix ? { __folderPrefix: item.folderPrefix } : {}),
+        },
       }
 
-      insertStmt.run(
-        id,
-        item.title,
-        item.artist,
-        item.album || null,
-        item.platform,
-        sourceId,
-        item.quality || settings.defaultQuality,
-        item.externalId || null,
-        item.matchMethod || 'id',
-        item.batchId || null,
-        item.playlistUrl || null,
-        JSON.stringify(musicPayload),
-        buildDedupKey(item.artist, item.title),
-        buildSearchText({ title: item.title, artist: item.artist, album: item.album }),
-        ts,
-        ts,
-      )
-      enqueuedIds.push(id)
-      itemResults.push({ ok: true, id })
+      // 2) 命中历史记录 → 按裁决处理
+      const hit = dbHits.get(index)
+      if (hit) {
+        const action = resolveDuplicateAction(item, undefined, settings)
+        if (action === 'enqueue') {
+          insertTaskRow(item, prepared)
+          enqueuedIds.push(prepared.id)
+          itemResults[index] = { ok: true, id: prepared.id, duplicate: hit }
+          continue
+        }
+        if (action === 'replace') {
+          // ④A：自动替换同样不得绕过音质保护
+          if (hit.qualityInverted) {
+            itemResults[index] = {
+              ok: false,
+              skipped: true,
+              error: '音质会降低，已跳过',
+              duplicate: hit,
+            }
+            continue
+          }
+          const replacedFrom = hit.existing!.id
+          updateRowForReplace(replacedFrom, item, prepared, settings)
+          replacedIds.push(replacedFrom)
+          itemResults[index] = { ok: true, id: replacedFrom, replaced: true, duplicate: hit }
+          continue
+        }
+        itemResults[index] = { ok: false, skipped: true, error: '疑似重复，已跳过', duplicate: hit }
+        continue
+      }
+
+      // 3) 无重复 → 正常入库
+      insertTaskRow(item, prepared)
+      enqueuedIds.push(prepared.id)
+      itemResults[index] = { ok: true, id: prepared.id }
     }
   })
 
   // 分块事务提交（每 200 条一次事务），降低单事务锁占用与 WAL 峰值
   const CHUNK_SIZE = 200
   for (let i = 0; i < items.length; i += CHUNK_SIZE) {
-    const chunk = items.slice(i, i + CHUNK_SIZE)
-    runInsertTransaction(chunk)
+    const indices: number[] = []
+    for (let j = i; j < Math.min(i + CHUNK_SIZE, items.length); j++) indices.push(j)
+    runChunkTransaction(indices)
   }
 
   if (!opts?.silent) {
     for (const id of enqueuedIds) {
       emitTask(id)
     }
+    for (const id of replacedIds) {
+      emitTask(id)
+    }
   }
-  downloadEvents.emit('batch_enqueued', { count: enqueuedIds.length, ids: enqueuedIds })
+  downloadEvents.emit('batch_enqueued', {
+    count: enqueuedIds.length,
+    ids: enqueuedIds,
+    skipped: itemResults.filter((r) => r?.skipped).length,
+    replaced: replacedIds.length,
+  })
   kickWorker()
 
+  const finalResults = itemResults.map((r) => r ?? { ok: false, error: '未处理' })
   return {
     total: items.length,
     enqueued: enqueuedIds.length,
+    skipped: finalResults.filter((r) => r.skipped).length,
+    replaced: replacedIds.length,
     ids: enqueuedIds,
-    results: itemResults,
+    results: finalResults,
+  }
+}
+
+/**
+ * 替换任务被中断（取消 / 失败）时，把记录指回旧文件。
+ *
+ * 替换是 UPDATE 同一行，`file_path` 在换之前就被置空 —— 若不还原，
+ * 旧文件还在磁盘上、记录却说「没有文件」，成为孤儿状态（R-d）。
+ */
+function restoreReplacePaths(
+  task: Pick<DownloadTaskRow, 'music_info_json'>,
+): { file_path: string | null; lyric_path: string | null } | null {
+  let musicInfo: Record<string, unknown> = {}
+  try {
+    musicInfo = JSON.parse(task.music_info_json || '{}')
+  } catch {
+    return null
+  }
+  const oldFile = typeof musicInfo.__replaceOldFile === 'string' ? musicInfo.__replaceOldFile : null
+  const oldLyric = typeof musicInfo.__replaceOldLyric === 'string' ? musicInfo.__replaceOldLyric : null
+  if (!oldFile && !oldLyric) return null
+  return {
+    file_path: oldFile && existsSync(oldFile) ? oldFile : null,
+    lyric_path: oldLyric && existsSync(oldLyric) ? oldLyric : null,
   }
 }
 
@@ -589,11 +958,13 @@ export function cancelTask(id: string) {
 
   if (task.status === 'queued' || task.status === 'running') {
     removeTaskFiles(task)
+    // 替换中的任务：记录指回旧文件（其 file_path 在替换前已置空，旧文件仍在磁盘上）
+    const restored = restoreReplacePaths(task)
     getDb()
       .prepare(
-        `UPDATE download_tasks SET status='cancelled', updated_at=?, error=?, file_path=NULL, lyric_path=NULL, file_size=NULL WHERE id=?`,
+        `UPDATE download_tasks SET status='cancelled', updated_at=?, error=?, file_path=?, lyric_path=?, file_size=NULL WHERE id=?`,
       )
-      .run(nowIso(), '用户取消', id)
+      .run(nowIso(), '用户取消', restored?.file_path ?? null, restored?.lyric_path ?? null, id)
   }
   emitTask(id)
   return getTask(id)!
@@ -913,20 +1284,32 @@ export function ensureDiskWritable(dir: string) {
   return assertDownloadDirWritable(dir)
 }
 
-async function resolveUrl(task: DownloadTaskRow, qualityPref: string) {
-  const musicInfo = JSON.parse(task.music_info_json || '{}')
-  const result = await resolveMusicUrl({
-    platform: task.platform,
-    musicInfo,
-    quality: qualityPref,
-    sourceId: task.source_id,
+/**
+ * 一次 worker 尝试内探索「音源 × 音质」组合的上限（兜底，防极端音源数下空转）。
+ *
+ * 取链层按「音质档位在外、音源在内」的顺序遍历，所以**前 N 次探测天然覆盖
+ * "每个音源各试一次它的最高档"** —— 这正是"换个音源也许有完整文件"最该验证的一轮。
+ * 因此实际预算取音源数：一轮走完仍全是试听，就如实报错，
+ * 剩下的低档位留给用户手动「重试」（排除集已持久化，重试会接着往下走）。
+ */
+const PREVIEW_COMBO_CAP = 20
+
+/** 达到该实测码率即视为真 Hi-Res —— 已无更好选择，提前收工 */
+const HIRES_KBPS = 1500
+
+/** 攒够这么多个「合格」候选就收工；排序仍会从中挑码率最大的 */
+const PROBE_OK_ENOUGH = 3
+
+/** 记录「已确认不可用」的组合（试听 / 谎报），让手动重试能从断点继续而不是重头再来 */
+function persistPreviewBlocked(
+  taskId: string,
+  musicInfo: Record<string, unknown>,
+  blocked: ReadonlySet<string>,
+) {
+  if (!blocked.size) return
+  updateTask(taskId, {
+    music_info_json: JSON.stringify({ ...musicInfo, __previewBlocked: [...blocked] }),
   })
-  // highest 轮询成功后可能换了音源，写回任务
-  if (result.sourceId && result.sourceId !== task.source_id) {
-    updateTask(task.id, { source_id: result.sourceId })
-    task.source_id = result.sourceId
-  }
-  return { url: result.url, quality: result.quality }
 }
 
 async function downloadFile(
@@ -951,7 +1334,12 @@ async function downloadFile(
   const expected = opts?.expectedDurationSec
   if (total > 0 && expected && expected >= 90) {
     const minBytes = minFullTrackBytes(expected, opts?.quality)
-    if (total < minBytes) throw previewSizeError(total, expected)
+    if (total < minBytes) {
+      // 预检在读 body **之前**触发：代价仅是一次请求头，所以调用方可以放心多试几个组合。
+      // 显式取消 body，避免留下悬挂连接
+      await res.body.cancel().catch(() => {})
+      throw previewSizeError(total, expected)
+    }
   }
   let received = 0
   const nodeStream = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
@@ -987,8 +1375,14 @@ async function processTask(task: DownloadTaskRow) {
   activeAbortControllers.set(task.id, abortController)
   activeProcessingTasks.add(task.id)
 
+  /** 最终落盘路径（下载校验通过后才存在） */
   let filePath: string | null = null
   let lyricPath: string | null = null
+  /** 临时路径：失败 / 取消时只需清理它们，最终路径上的既有文件不受影响 */
+  let tempPath: string | null = null
+  let lyricTempPath: string | null = null
+  /** 是否已提交落盘（rename 之后）。提交前失败绝不触碰既有文件 */
+  let committed = false
   const settings = getSettings()
   try {
     const current = getTask(task.id)
@@ -1000,75 +1394,256 @@ async function processTask(task: DownloadTaskRow) {
     if (!started) return
     ensureDownloadDirWritable(settings.downloadDir)
     const musicInfo = JSON.parse(task.music_info_json || '{}') as Record<string, unknown>
-    const { url, quality } = await resolveUrl(task, task.quality || settings.defaultQuality)
-    if (abortController.signal.aborted) throw new Error('cancelled')
-    if (isLikelyPreviewUrl(url)) throw previewUrlError()
-
     const expectedDuration = expectedDurationFromMusicInfo(musicInfo)
 
     const dir = getDownloadDir(settings.downloadDir)
     const trackNo = (musicInfo.track || musicInfo.trackNo || musicInfo.tracknum || musicInfo.no) as string | number | undefined
     const folderPrefix =
       typeof musicInfo.__folderPrefix === 'string' ? musicInfo.__folderPrefix : null
-    const base = buildDownloadRelativeBase(
-      settings.nameTemplate,
-      {
-        artist: task.artist,
-        title: task.title,
-        album: task.album || undefined,
-        platform: task.platform,
-        quality,
-        id: task.external_id || undefined,
-        track: trackNo,
-      },
-      folderPrefix,
+    const qualityPref = task.quality || settings.defaultQuality
+
+    /**
+     * 已确认不可用而需要跳过的 `sourceId@quality` 组合（试听 / 谎报档位）。
+     *
+     * 取链成功**不代表内容正确** —— 会员曲目能取到链接但内容是 60s 试听，
+     * 也有音源把 320k mp3 标成 flac24bit。这些都只有拿到响应头/文件才暴露，
+     * 所以把结论回灌给取链层，避免下次又选中同一条"看起来成功"的路。
+     */
+    const previewBlocked = new Set<string>(
+      Array.isArray(musicInfo.__previewBlocked) ? (musicInfo.__previewBlocked as string[]) : [],
     )
-    const ext = guessExt(url, quality)
-    filePath = joinDownloadRelative(dir, base, ext)
-    ensureParentDir(filePath)
-    await downloadFile(
-      url,
-      filePath,
-      (p, received, total) =>
-        updateTask(
-          task.id,
-          {
-            progress: p,
-            quality,
-            file_size: total > 0 ? total : received || null,
-          },
-          { throttleProgress: true },
-        ),
-      abortController.signal,
-      { expectedDurationSec: expectedDuration, quality },
+    /** 本次尝试新排除了几个组合 —— 只在有新增时才写回，避免每次下载都白写一次 */
+    const blockedAtStart = previewBlocked.size
+    // 探测预算 = 音源数（覆盖"每个音源试它的最高档"一整轮），并有上限兜底
+    const probeBudget = Math.min(
+      Math.max(listEnabledOkSources(task.platform).length, 4),
+      PREVIEW_COMBO_CAP,
     )
 
-    if (abortController.signal.aborted) throw new Error('cancelled')
-
-    // 按文件魔数纠正扩展名，避免「标称 flac、实为 mp3」导致元数据写入失败
-    filePath = alignFileExtension(filePath, base, dir)
-
+    let quality = qualityPref
     let fileSize: number | null = null
-    try {
-      fileSize = statSync(filePath).size
-    } catch {
-      fileSize = null
+    let base = ''
+    let plannedPath = ''
+    let temp = ''
+    let downloaded = false
+
+    // ── 阶段 1：收集候选并探测（每个候选只读响应头，不下载内容）──
+    type Candidate = {
+      url: string
+      quality: string
+      sourceId: string
+      sourceName: string
+      estKbps: number | null
+      verdict: CandidateVerdict
+    }
+    const candidates: Candidate[] = []
+    let okCount = 0
+
+    // 列举与探测交织：候选一到手就立刻探测，满足收工条件即停止列举 ——
+    // 否则 15 个音源全探一遍会让每首歌多花十几秒
+    const listed = await listMusicUrlCandidates({
+      platform: task.platform,
+      musicInfo,
+      quality: qualityPref,
+      sourceId: task.source_id,
+      exclude: previewBlocked,
+      limit: probeBudget,
+      onCandidate: async (cand) => {
+        if (abortController.signal.aborted) return false
+        const key = `${cand.sourceId}@${cand.quality}`
+        if (isLikelyPreviewUrl(cand.url)) {
+          previewBlocked.add(key)
+          return
+        }
+        const probe = await probeCandidate(cand.url, {
+          expectedDurationSec: expectedDuration,
+          quality: cand.quality,
+          signal: abortController.signal,
+        })
+        if (probe.verdict === 'preview') {
+          previewBlocked.add(key)
+          recordSourceOutcome({
+            sourceId: cand.sourceId,
+            platform: task.platform,
+            outcome: 'preview',
+          })
+          console.warn(`[download] ${task.title}: ${key} ${probe.reason} → 排除`)
+          return
+        }
+        if (probe.verdict === 'error') {
+          console.warn(`[download] ${task.title}: ${key} 探测失败（${probe.reason}）→ 跳过`)
+          return
+        }
+        candidates.push({ ...cand, estKbps: probe.estKbps, verdict: probe.verdict })
+        if (probe.verdict === 'ok') okCount++
+        // 已是真 Hi-Res：但至少留一个对照候选再收工 ——
+        // 否则这条"看起来是 Hi-Res"的路一旦是谎报（L2 才识破），本轮到这就没牌可打了
+        if (
+          probe.verdict === 'ok' &&
+          (probe.estKbps ?? 0) >= HIRES_KBPS &&
+          candidates.length >= 2
+        ) {
+          return false
+        }
+        // 已攒够足够多的合格候选 → 收工（下面的排序仍会从中挑最大的）
+        if (okCount >= PROBE_OK_ENOUGH) return false
+      },
+    })
+
+    if (!candidates.length) {
+      if (previewBlocked.size > 0) {
+        persistPreviewBlocked(task.id, musicInfo, previewBlocked)
+        // 还有没探查过的组合时才说"重试可继续"，否则如实告知可能需会员
+        throw allPreviewError(previewBlocked.size, listed.truncated)
+      }
+      const detail = listed.errors.slice(0, 12).join(' | ') || '无详细错误'
+      throw Object.assign(
+        new Error(
+          isHighestQuality(qualityPref)
+            ? `取链失败（已轮询 ${listed.loadedCount} 个音源并尝试降级）：${detail}`
+            : `取链失败（已轮询 ${listed.loadedCount} 个音源）：${detail}`,
+        ),
+        { code: 'GET_URL_FAILED' },
+      )
     }
 
-    // 试听检测：有期望时长则对比；否则兜底识别常见固定试听时长
-    {
-      const actual = await probeAudioDurationSeconds(filePath)
-      if (actual != null) {
-        if (expectedDuration && expectedDuration > 0 && isLikelyPreviewClip(actual, expectedDuration)) {
-          throw previewClipError(actual, expectedDuration)
+    /**
+     * **按实测码率择优** —— 声称的档位不可信：
+     * 实测里 `Hei Music` 声称 flac24bit 只有 321kbps，而 `念心音源` 声称 flac 有 933kbps。
+     * 若按声称档位排，谎报的那个会排在真无损前面 —— 正是本次要修的问题。
+     * 探测不到码率的（`unknown`）排最后，作为兜底候选。
+     */
+    candidates.sort((a, b) => (b.estKbps ?? -1) - (a.estKbps ?? -1))
+
+    console.warn(
+      `[download] ${task.title}: 候选 ${candidates.length} 个 → ` +
+        candidates
+          .map((c) => `${c.sourceId.slice(0, 8)}@${c.quality}(${c.estKbps ? Math.round(c.estKbps) + 'k' : '未知'})`)
+          .join(' > '),
+    )
+
+    // ── 阶段 2：按序下载，首个通过全部校验者胜出 ──
+    for (const cand of candidates) {
+      if (abortController.signal.aborted) throw new Error('cancelled')
+      // 档位与实测不符时（兜底候选），按实测码率反推真实档位写回，别沿用谎报值
+      quality =
+        cand.verdict === 'ok' || cand.estKbps == null
+          ? cand.quality
+          : qualityFromBitrate(cand.estKbps)
+      const key = `${cand.sourceId}@${cand.quality}`
+
+      base = buildDownloadRelativeBase(
+        settings.nameTemplate,
+        {
+          artist: task.artist,
+          title: task.title,
+          album: task.album || undefined,
+          platform: task.platform,
+          quality,
+          id: task.external_id || undefined,
+          track: trackNo,
+        },
+        folderPrefix,
+      )
+      const ext = guessExt(cand.url, quality)
+      // 计划落点：扩展名先按 URL / 音质猜，下载完成后再以魔数纠正
+      plannedPath = joinDownloadRelative(dir, base, ext)
+      filePath = plannedPath
+      temp = joinDownloadRelative(dir, `${base}${TEMP_SUFFIX}`, ext)
+      tempPath = temp
+      ensureParentDir(temp)
+
+      try {
+        await downloadFile(
+          cand.url,
+          temp,
+          (p, received, total) =>
+            updateTask(
+              task.id,
+              {
+                progress: p,
+                quality,
+                file_size: total > 0 ? total : received || null,
+              },
+              { throttleProgress: true },
+            ),
+          abortController.signal,
+          { expectedDurationSec: expectedDuration, quality },
+        )
+
+        if (abortController.signal.aborted) throw new Error('cancelled')
+
+        try {
+          fileSize = statSync(temp).size
+        } catch {
+          fileSize = null
         }
-        if (
-          !(expectedDuration && expectedDuration > 0) &&
-          isLikelyPreviewByAbsoluteDuration(actual, fileSize)
-        ) {
-          throw previewClipError(actual, null)
+
+        // L2 兜底：声称无损但实际是 mp3（L1 拿不到 Content-Length 时靠这一步识破）
+        const sniffed = sniffAudioExt(temp)
+        if (isLosslessClaimMismatch(cand.quality, sniffed)) {
+          const err = new Error(
+            `音源声称 ${cand.quality}，实际是 ${sniffed}（${cand.sourceId.slice(0, 8)}）`,
+          ) as Error & { code?: string }
+          err.code = 'QUALITY_MISMATCH'
+          throw err
         }
+
+        // 试听检测：有期望时长则对比；否则兜底识别常见固定试听时长（对临时文件探测，内容一致）
+        const actual = await probeAudioDurationSeconds(temp)
+        if (actual != null) {
+          if (expectedDuration && expectedDuration > 0 && isLikelyPreviewClip(actual, expectedDuration)) {
+            throw previewClipError(actual, expectedDuration)
+          }
+          if (
+            !(expectedDuration && expectedDuration > 0) &&
+            isLikelyPreviewByAbsoluteDuration(actual, fileSize)
+          ) {
+            throw previewClipError(actual, null)
+          }
+        }
+      } catch (err: unknown) {
+        const code = String((err as { code?: string })?.code)
+        if (code !== 'PREVIEW_CLIP' && code !== 'QUALITY_MISMATCH') throw err
+        previewBlocked.add(key)
+        recordSourceOutcome({
+          sourceId: cand.sourceId,
+          platform: task.platform,
+          outcome: code === 'QUALITY_MISMATCH' ? 'quality-lie' : 'preview',
+        })
+        removeFileQuiet(temp)
+        tempPath = null
+        filePath = null
+        console.warn(
+          `[download] ${task.title}: ${(err as Error).message} → 排除 ${key}，换下一个候选`,
+        )
+        continue
       }
+      // 记录实际交付的音源：后续重试可优先复用，也是音源评分的依据
+      if (cand.sourceId !== task.source_id) {
+        updateTask(task.id, { source_id: cand.sourceId })
+        task.source_id = cand.sourceId
+      }
+      recordSourceOutcome({
+        sourceId: cand.sourceId,
+        platform: task.platform,
+        outcome: 'success',
+        kbps: cand.estKbps,
+      })
+      downloaded = true
+      break
+    }
+
+    if (!downloaded) {
+      // 把已排除的组合持久化，手动重试可以从断点继续而不是重头再来
+      persistPreviewBlocked(task.id, musicInfo, previewBlocked)
+      throw allPreviewError(previewBlocked.size, listed.truncated)
+    }
+
+    // 刻意**不**清除排除集：它是"哪些路走过不通"的学习结果。
+    // 保留后，替换/重下同一首时会直接跳开谎报与试听的音源，而不是重新踩一遍。
+    if (previewBlocked.size > blockedAtStart) {
+      persistPreviewBlocked(task.id, musicInfo, previewBlocked)
     }
 
     const downloadLyric =
@@ -1087,15 +1662,19 @@ async function processTask(task: DownloadTaskRow) {
       }
     }
 
+    // 歌词也先落临时文件，与音频一并在提交阶段 rename —— 否则替换时会提前删掉旧歌词
+    let lyricTemp: string | null = null
     if (lrcText && lyricMode === 'external') {
       lyricPath = joinDownloadRelative(dir, base, 'lrc')
-      ensureParentDir(lyricPath)
-      writeFileSync(lyricPath, lrcText, 'utf8')
+      lyricTemp = joinDownloadRelative(dir, `${base}${TEMP_SUFFIX}`, 'lrc')
+      lyricTempPath = lyricTemp
+      ensureParentDir(lyricTemp)
+      writeFileSync(lyricTemp, lrcText, 'utf8')
     }
 
-    // 元数据：基础字段 + 封面 +（仅内嵌模式）歌词
+    // 元数据：基础字段 + 封面 +（仅内嵌模式）歌词（仍作用于临时文件）
     const metaResult = await writeAudioMetadata(
-      filePath,
+      temp,
       {
         title: task.title,
         artist: task.artist,
@@ -1111,12 +1690,18 @@ async function processTask(task: DownloadTaskRow) {
       console.warn('[download] metadata:', metaResult.reason)
     }
 
-    // 取消竞态：完成后才发现已取消 → 删文件
-    if (abortController.signal.aborted) {
-      removeFileQuiet(filePath)
-      removeFileQuiet(lyricPath)
-      throw new Error('cancelled')
+    // 取消竞态：提交前发现已取消 → 只清临时文件，最终路径上的既有文件不受影响
+    if (abortController.signal.aborted) throw new Error('cancelled')
+
+    // 提交：原子 rename 到最终路径。**此刻起**才可能覆盖既有文件（D6-A 的核心保证）
+    filePath = commitDownloadedFile(temp, base, dir, plannedPath)
+    if (lyricTemp && lyricPath) {
+      ensureParentDir(lyricPath)
+      renameSync(lyricTemp, lyricPath)
+      lyricTempPath = null
     }
+    committed = true
+    tempPath = null
 
     // CAS：仅 running → completed。未命中说明任务已被取消，清理本地文件并保留取消态
     const completed = applyStatusTransition(
@@ -1132,9 +1717,13 @@ async function processTask(task: DownloadTaskRow) {
       },
       ['running'],
     )
-    if (!completed) {
+    if (completed) {
+      // 替换任务：旧文件留到新文件完全落地后才删（R-d）
+      cleanupReplacedFiles(task)
+    } else {
       removeFileQuiet(filePath)
       removeFileQuiet(lyricPath)
+      committed = false
     }
   } catch (err: unknown) {
     const e = err as { message?: string; code?: string; name?: string }
@@ -1143,16 +1732,24 @@ async function processTask(task: DownloadTaskRow) {
       msg = `无下载目录写入权限: ${settings.downloadDir}`
       Object.assign(err as object, { code: 'EACCES' })
     }
-    removeFileQuiet(filePath)
-    removeFileQuiet(lyricPath)
+    // 未提交：只清临时产物 → 最终路径上的既有文件（含被替换的旧文件）完整保留（D6-A / R-d）
+    removeFileQuiet(tempPath)
+    removeFileQuiet(lyricTempPath)
+    if (committed) {
+      removeFileQuiet(filePath)
+      removeFileQuiet(lyricPath)
+      committed = false
+    }
+    // 替换任务中断时把记录指回旧文件，避免"旧文件还在、记录却说没有"
+    const restored = restoreReplacePaths(task)
     if (msg === 'cancelled' || abortController.signal.aborted || e?.name === 'AbortError') {
       applyStatusTransition(
         task.id,
         {
           status: 'cancelled',
           error: '用户取消',
-          file_path: null,
-          lyric_path: null,
+          file_path: restored?.file_path ?? null,
+          lyric_path: restored?.lyric_path ?? null,
           file_size: null,
         },
         ['queued', 'running'],
@@ -1163,17 +1760,29 @@ async function processTask(task: DownloadTaskRow) {
     const settings2 = getSettings()
     const qualityPref = task.quality || settings2.defaultQuality
     const fixedQuality = !isHighestQuality(qualityPref)
-    // 试听片段：只标失败，不自动换源/重试；由用户在队列手动换源
+    /**
+     * 试听片段**可以**自动进入下一轮。
+     *
+     * 早期实现把它当作终结态（"只标失败，由用户手动换源"），前提是"试听 ⇒ 该曲目在哪都下不到"
+     * —— 这个前提是错的：不同音源走的接口与账号不同，A 源只给试听、B 源可能是完整文件。
+     * 而且 `highest` 的定义就是「多源轮询 + 降级」，遇到试听就停等于放弃降级。
+     *
+     * 单轮已在上面的组合循环里探完一整轮音源（每源试它的最高档）；
+     * 这里让它回队列进入下一轮 = 继续降档。排除集已持久化在任务上，不会重复探同一组合。
+     * 轮次由 `maxAttempts` 约束，不会无限空转。
+     */
     const isPreview = String(e?.code) === 'PREVIEW_CLIP'
     const isPerm = isDownloadPermissionError(err)
     // 固定音质：resolve 已轮询全部音源；失败即停并提示原因
-    const retryable = isPreview || isPerm
+    const retryable = isPerm
       ? false
-      : fixedQuality
-        ? isRetryableError(err) || String(e?.code) === 'HTTP_RETRY'
-        : isRetryableError(err) ||
-          String(e?.code) === 'HTTP_RETRY' ||
-          String(e?.code) === 'GET_URL_FAILED'
+      : isPreview
+        ? true
+        : fixedQuality
+          ? isRetryableError(err) || String(e?.code) === 'HTTP_RETRY'
+          : isRetryableError(err) ||
+            String(e?.code) === 'HTTP_RETRY' ||
+            String(e?.code) === 'GET_URL_FAILED'
     const alts = fixedQuality
       ? []
       : listEnabledOkSources(task.platform).filter((s) => s.id !== task.source_id)
@@ -1194,8 +1803,8 @@ async function processTask(task: DownloadTaskRow) {
           source_id: next?.id || task.source_id,
           error: `失败重试(${attempts}/${settings2.maxAttempts}): ${msg}`,
           progress: 0,
-          file_path: null,
-          lyric_path: null,
+          file_path: restored?.file_path ?? null,
+          lyric_path: restored?.lyric_path ?? null,
           file_size: null,
         },
         ['running'],
@@ -1209,8 +1818,8 @@ async function processTask(task: DownloadTaskRow) {
           attempts,
           error: msg,
           progress: 0,
-          file_path: null,
-          lyric_path: null,
+          file_path: restored?.file_path ?? null,
+          lyric_path: restored?.lyric_path ?? null,
           file_size: null,
         },
         ['running'],
@@ -1237,25 +1846,29 @@ function guessExt(url: string, quality: string) {
   return 'mp3'
 }
 
-/** 若魔数与扩展名不一致则重命名到正确后缀 */
-function alignFileExtension(filePath: string, base: string, dir: string): string {
-  const sniffed = sniffAudioExt(filePath)
-  if (!sniffed) return filePath
-  const cur = filePath.includes('.') ? filePath.split('.').pop()!.toLowerCase() : ''
-  if (cur === sniffed) return filePath
-  const next = joinDownloadRelative(dir, base, sniffed)
-  if (next === filePath) return filePath
-  try {
-    ensureParentDir(next)
-    if (existsSync(next) && next !== filePath) unlinkSync(next)
-    renameSync(filePath, next)
-    console.warn(`[download] 扩展名已纠正: .${cur || '?'} → .${sniffed}`)
-    return next
-  } catch (e: unknown) {
-    const err = e as { message?: string }
-    console.warn('[download] 扩展名纠正失败:', err?.message || e)
-    return filePath
+/**
+ * 把临时文件落到最终路径：按魔数纠正扩展名后**原子 rename**。
+ *
+ * D6-A：这是"下载成功才覆盖既有文件"的唯一落点 —— 失败 / 取消时旧文件原样保留。
+ * 扩展名纠正不再需要预先 `unlink` 目标（rename 本身原子覆盖）。
+ */
+function commitDownloadedFile(
+  tempPath: string,
+  base: string,
+  dir: string,
+  plannedPath: string,
+): string {
+  const sniffed = sniffAudioExt(tempPath)
+  const plannedExt = plannedPath.includes('.') ? plannedPath.split('.').pop()!.toLowerCase() : ''
+  let finalPath = plannedPath
+  if (sniffed && sniffed !== plannedExt) {
+    // 避免「标称 flac、实为 mp3」导致元数据写入失败
+    finalPath = joinDownloadRelative(dir, base, sniffed)
+    console.warn(`[download] 扩展名已纠正: .${plannedExt || '?'} → .${sniffed}`)
   }
+  ensureParentDir(finalPath)
+  renameSync(tempPath, finalPath)
+  return finalPath
 }
 
 export async function tickWorker() {

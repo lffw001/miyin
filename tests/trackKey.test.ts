@@ -3,6 +3,7 @@ import {
   FIELD_SEP,
   normalizeText,
   normalizeForDedup,
+  normalizeForMatch,
   normalizeSearchToken,
   primaryArtist,
   buildDedupKey,
@@ -23,18 +24,33 @@ describe('normalizeText', () => {
   })
 })
 
-describe('normalizeForDedup', () => {
-  it('去除括号及其内容（已确认口径：Live 与录音室版同曲）', () => {
-    expect(normalizeForDedup('稻香 (Live)')).toBe('稻香')
+describe('normalizeForDedup（口径 v2：保留括号，允许版本共存）', () => {
+  it('保留括号内容 —— 不同版本归一结果不同', () => {
+    expect(normalizeForDedup('稻香 (Live)')).toBe('稻香(live)')
+    expect(normalizeForDedup('稻香（Demo）')).toBe('稻香(demo)')
     expect(normalizeForDedup('稻香')).toBe('稻香')
   })
 
-  it('全角半角括号归一后一致', () => {
+  it('全角半角括号、大小写、空格差异仍归一一致（同一版本）', () => {
     expect(normalizeForDedup('稻香（Live）')).toBe(normalizeForDedup('稻香 (Live)'))
+    expect(normalizeForDedup('稻香( LIVE )')).toBe(normalizeForDedup('稻香(live)'))
+  })
+})
+
+describe('normalizeForMatch（模糊匹配：去括号）', () => {
+  it('去除括号及其内容，用于宽松召回', () => {
+    expect(normalizeForMatch('稻香 (Live)')).toBe('稻香')
+    expect(normalizeForMatch('稻香')).toBe('稻香')
   })
 
-  it('括号内空白不影响归一结果', () => {
-    expect(normalizeForDedup('稻香( mix )')).toBe(normalizeForDedup('稻香(mix)'))
+  it('全括号标题归一为空串（trackMatcher 依赖此行为做守卫）', () => {
+    expect(normalizeForMatch('（伴奏）')).toBe('')
+    expect(normalizeForMatch('(纯音乐)')).toBe('')
+  })
+
+  it('与判重口径故意不同', () => {
+    // 同一输入，两个函数结果不同 —— 这不是 bug，是两者的目标不同
+    expect(normalizeForMatch('稻香 (Live)')).not.toBe(normalizeForDedup('稻香 (Live)'))
   })
 })
 
@@ -50,11 +66,16 @@ describe('normalizeSearchToken', () => {
 })
 
 describe('buildDedupKey', () => {
-  it('Live 版与录音室版同键（用户确认口径的回归锚点）', () => {
-    expect(buildDedupKey('周杰伦', '稻香 (Live)')).toBe(buildDedupKey('周杰伦', '稻香'))
+  it('版本差异 → 不同键（口径 v2 的核心：允许同曲多版本共存）', () => {
+    const base = buildDedupKey('周杰伦', '稻香')
+    expect(buildDedupKey('周杰伦', '稻香 (Live)')).not.toBe(base)
+    expect(buildDedupKey('周杰伦', '稻香（demo）')).not.toBe(base)
+    expect(buildDedupKey('周杰伦', '稻香（钢琴版）')).not.toBe(base)
+    // 各版本之间也互不相同
+    expect(buildDedupKey('周杰伦', '稻香 (Live)')).not.toBe(buildDedupKey('周杰伦', '稻香（demo）'))
   })
 
-  it('全角半角括号、大小写、空格差异均同键', () => {
+  it('全角半角括号、大小写、空格差异均同键（同一版本）', () => {
     const base = buildDedupKey('周杰伦', '稻香 (Live)')
     expect(buildDedupKey('周杰伦', '稻香（live）')).toBe(base)
     expect(buildDedupKey(' 周杰伦 ', ' 稻香  ( LIVE ) ')).toBe(base)
@@ -74,16 +95,13 @@ describe('buildDedupKey', () => {
     expect(buildDedupKey('周杰伦 & 方文山', '稻香')).toBe(buildDedupKey('周杰伦', '稻香'))
   })
 
-  it('括号内容一律被剥离：伴奏版 / 现场版都与录音室版同键（口径一致性）', () => {
-    expect(buildDedupKey('周杰伦', '稻香（伴奏）')).toBe(buildDedupKey('周杰伦', '稻香'))
-    expect(buildDedupKey('周杰伦', '稻香 (Live)')).toBe(buildDedupKey('周杰伦', '稻香'))
-  })
-
-  it('全部为括号的标题回退到保留括号形态，不与其它曲目误判', () => {
+  it('全括号标题因保留括号而天然互相区分', () => {
     const a = buildDedupKey('周杰伦', '（伴奏）')
     const b = buildDedupKey('周杰伦', '（纯音乐）')
     expect(a).not.toBe(b)
     expect(a).not.toBe(buildDedupKey('周杰伦', '稻香'))
+    // 不再是空串（v1 要靠回退兜底，v2 无需）
+    expect(normalizeForDedup('（伴奏）')).toBe('(伴奏)')
   })
 
   it('双字段都为空时返回空串（调用方应视为无判重键）', () => {

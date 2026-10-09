@@ -3,6 +3,7 @@ import {
   DOWNLOAD_QUALITY_OPTIONS,
   type DownloadQuality,
 } from '~/utils/mediaLabels'
+import { buildDedupKey } from '#shared/trackKey'
 
 export type AlbumTrack = {
   externalId: string
@@ -38,10 +39,13 @@ const props = withDefaults(
     albumFolderTemplate: string
     /** 全屏详情（H5）显示返回；PC 侧栏内嵌时可关闭 */
     showBack?: boolean
+    /** 「已在库」徽标（C3）：命中下载记录的 `dedupKey` 集合 */
+    libraryKeys?: Set<string>
   }>(),
   {
     loading: false,
     showBack: true,
+    libraryKeys: () => new Set<string>(),
   },
 )
 
@@ -56,6 +60,11 @@ const emit = defineEmits<{
 }>()
 
 const selected = ref<Set<number>>(new Set())
+
+/** 判定复用 shared/trackKey，与服务端判重口径严格一致 */
+function inLibrary(track: AlbumTrack) {
+  return props.libraryKeys.has(buildDedupKey(track.artist, track.title))
+}
 
 const folderPreview = computed(() => {
   if (!props.albumDownloadToFolder) return ''
@@ -214,6 +223,11 @@ function enqueueAll() {
               @change="toggleOne(i, ($event.target as HTMLInputElement).checked)"
             />
             <span class="track-title">{{ t.title }}</span>
+            <span
+              v-if="inLibrary(t)"
+              class="lib-badge"
+              title="下载记录中已存在同一首歌"
+            >已在库</span>
             <span class="muted track-artist">{{ t.artist }}</span>
             <span class="muted track-dur">{{ fmtDur(t.duration) }}</span>
           </label>
@@ -342,6 +356,15 @@ function enqueueAll() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.lib-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: 4px;
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
 }
 .track-artist,
 .track-dur {

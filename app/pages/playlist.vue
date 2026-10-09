@@ -5,6 +5,10 @@ import {
   platformListText,
   type DownloadQuality,
 } from '~/utils/mediaLabels'
+import type {
+  DuplicateDecision,
+  DuplicateReviewItem,
+} from '~/components/DuplicateReviewDialog.vue'
 
 type Track = {
   externalId?: string
@@ -54,12 +58,18 @@ type EnqueueResultPayload = {
   enqueued: number
   total: number
   batchId?: string
+  /** 因疑似重复被跳过的条数 */
+  skipped?: number
+  /** 替换既有记录的条数 */
+  replaced?: number
   results?: Array<{
     title: string
     ok: boolean
     method?: string
     error?: string
     taskId?: string
+    skipped?: boolean
+    replaced?: boolean
   }>
 }
 
@@ -365,6 +375,62 @@ function buildResolvedTracks(rows: MatchRow[]): Track[] {
   return out
 }
 
+/** 疑似重复预检弹窗（①A）；用户取消时 resolve(null)，调用方中止入队 */
+const dupDialogOpen = ref(false)
+const dupItems = ref<DuplicateReviewItem[]>([])
+let dupResolver: ((decisions: Map<number, DuplicateDecision> | null) => void) | null = null
+
+function onDupConfirm(decisions: Map<number, DuplicateDecision>) {
+  dupDialogOpen.value = false
+  dupResolver?.(decisions)
+  dupResolver = null
+}
+
+function onDupCancel() {
+  dupDialogOpen.value = false
+  dupResolver?.(null)
+  dupResolver = null
+}
+
+async function onDupMute() {
+  try {
+    await $fetch('/api/settings', { method: 'PUT', body: { duplicatePolicy: 'skip' } })
+    toast.info('已设为自动跳过重复项，可在设置中改回')
+  } catch {
+    /* 静默：不影响本次裁决 */
+  }
+}
+
+async function checkDuplicates(
+  rows: Array<{ title: string; artist: string; album?: string | null }>,
+): Promise<Map<number, DuplicateDecision> | null> {
+  try {
+    const res = await $fetch<{ duplicates: DuplicateReviewItem[] }>(
+      '/api/downloads/duplicate-check',
+      {
+        method: 'POST',
+        body: {
+          items: rows.map((r) => ({
+            title: r.title,
+            artist: r.artist,
+            album: r.album ?? null,
+            quality: quality.value,
+          })),
+        },
+      },
+    )
+    if (!res.duplicates.length) return new Map()
+    dupItems.value = res.duplicates
+    dupDialogOpen.value = true
+    return await new Promise<Map<number, DuplicateDecision> | null>((resolve) => {
+      dupResolver = resolve
+    })
+  } catch {
+    // 预检失败不阻断下载，交回服务端按策略处理
+    return new Map()
+  }
+}
+
 async function enqueueMatched(rows: MatchRow[]) {
   if (!preview.value) return
   const tracks = buildResolvedTracks(rows)
@@ -375,13 +441,19 @@ async function enqueueMatched(rows: MatchRow[]) {
   loadingText.value = '入队中…'
   loading.value = true
   try {
+    // ①A：先预检，重复项交给聚合弹窗裁决
+    const decisions = await checkDuplicates(
+      tracks.map((t) => ({ title: t.title, artist: t.artist, album: t.album })),
+    )
+    if (decisions === null) return
+
     const res = await $fetch<EnqueueResultPayload>('/api/playlist/enqueue', {
       method: 'POST',
       body: {
         url: preview.value.url || url.value,
         title: preview.value.title,
         platform: preview.value.platform,
-        tracks,
+        tracks: tracks.map((t, i) => ({ ...t, duplicateAction: decisions.get(i) })),
         downloadLyric: withLyric.value,
         lyricMode: lyricMode.value,
         quality: quality.value,
@@ -398,8 +470,13 @@ async function enqueueMatched(rows: MatchRow[]) {
 function openEnqueueResult(res: EnqueueResultPayload) {
   result.value = res
   showResult.value = true
+  const skipped = res.skipped ?? 0
   if (res.enqueued > 0) {
-    toast.success(`成功入队 ${res.enqueued} 首`)
+    toast.success(
+      `成功入队 ${res.enqueued} 首` + (skipped ? `，${skipped} 首疑似重复已跳过` : ''),
+    )
+  } else if (skipped > 0) {
+    toast.info(`${skipped} 首疑似重复已跳过`)
   } else {
     toast.warning('未能入队任何曲目')
   }
@@ -533,6 +610,14 @@ async function confirmAndEnqueue() {
       v-model:open="showResult"
       :result="result"
       @retry-failed="retryFailedEnqueue"
+    />
+
+    <DuplicateReviewDialog
+      v-model:open="dupDialogOpen"
+      :items="dupItems"
+      @confirm="onDupConfirm"
+      @cancel="onDupCancel"
+      @mute="onDupMute"
     />
   </div>
 </template>

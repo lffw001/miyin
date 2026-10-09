@@ -97,11 +97,46 @@ function migrateSchema(db: Database.Database) {
   }
 
   db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
-    CREATE INDEX IF NOT EXISTS idx_download_tasks_playlist_url ON download_tasks(playlist_url);
-    CREATE INDEX IF NOT EXISTS idx_download_tasks_batch_id ON download_tasks(batch_id);
-    CREATE INDEX IF NOT EXISTS idx_download_tasks_dedup_key ON download_tasks(dedup_key);
-  `)
+CREATE INDEX IF NOT EXISTS idx_download_tasks_status ON download_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_download_tasks_playlist_url ON download_tasks(playlist_url);
+CREATE INDEX IF NOT EXISTS idx_download_tasks_batch_id ON download_tasks(batch_id);
+CREATE INDEX IF NOT EXISTS idx_download_tasks_dedup_key ON download_tasks(dedup_key);
+
+-- 音源实测表现统计：用于"先探哪个音源"的排序（按 source_id + platform 聚合）
+CREATE TABLE IF NOT EXISTS source_stats (
+  source_id      TEXT NOT NULL,
+  platform       TEXT NOT NULL,
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  successes      INTEGER NOT NULL DEFAULT 0,
+  previews       INTEGER NOT NULL DEFAULT 0,
+  quality_lies   INTEGER NOT NULL DEFAULT 0,
+  kbps_sum       REAL NOT NULL DEFAULT 0,
+  kbps_count     INTEGER NOT NULL DEFAULT 0,
+  last_success_at TEXT,
+  PRIMARY KEY (source_id, platform)
+);
+`)
+
+  migrateDedupKeyVersion(db)
+}
+
+/**
+ * 判重键的归一化口径版本。
+ *
+ * - v1（初版）：`dedup_key` **去除**括号内容 → `稻香 (Live)` ≡ `稻香`
+ * - v2（2026-10-09）：**保留**括号内容 → 允许同一首歌的多个版本共存
+ *
+ * 口径变更后旧键语义失效，必须整体置空重算 —— 否则 `稻香 (Demo)` 会继续被判为「已存在」。
+ * `search_text` 规则未变，无需重算。
+ */
+const DEDUP_KEY_VERSION = 2
+
+function migrateDedupKeyVersion(db: Database.Database) {
+  const current = db.pragma('user_version', { simple: true }) as number
+  if (current >= DEDUP_KEY_VERSION) return
+  // 置空后由 backfillTrackKeys() 按新口径重算；期间判重会退化为「不命中」（放行），比误判重安全
+  db.exec(`UPDATE download_tasks SET dedup_key = NULL`)
+  db.pragma(`user_version = ${DEDUP_KEY_VERSION}`)
 }
 
 /** 单批回填条数：控制单事务锁占用与 WAL 峰值（与批量入队的分块策略一致） */

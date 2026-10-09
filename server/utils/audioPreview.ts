@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { MIN_KBPS_ANY, estimateBitrateKbps, qualityPlausibility } from '#shared/quality'
 
 /** 解析 interval / duration 为秒。支持 "4:28"、"1:02:03"、秒数字、毫秒大数 */
 export function parseIntervalToSeconds(raw: unknown): number | null {
@@ -104,16 +105,128 @@ export function previewClipError(actualSec: number, expectedSec?: number | null)
   return err
 }
 
-export function previewUrlError(): Error {
-  const err = new Error('音源返回疑似试听链接，请换源后重试')
-  ;(err as any).code = 'PREVIEW_CLIP'
-  return err
-}
-
 export function previewSizeError(contentLength: number, expectedSec: number): Error {
   const err = new Error(
     `响应体积过小（${Math.round(contentLength / 1024)}KB，期望时长约 ${Math.round(expectedSec)}s），疑似试听，请换源后重试`,
   )
   ;(err as any).code = 'PREVIEW_CLIP'
   return err
+}
+
+/**
+ * 组合预算用尽时的收尾错误。
+ *
+ * 与上面几个的区别：那几个是「这一条路走不通」的中间态，本函数是「已经试过 N 条路」的结论 ——
+ * 必须说清试了什么、为什么停，而不是笼统地让用户「请换源后重试」。
+ *
+ * `hasMore` 为 `true` 表示还有未试过的组合，手动重试可以继续（排除集已持久化在任务上）。
+ */
+export function allPreviewError(tried: number, hasMore: boolean): Error {
+  const tail = hasMore
+    ? '，可点「重试」继续尝试其余音源'
+    : '，该曲目在当前平台可能仅对会员开放'
+  const err = new Error(`已试过 ${tried} 个音源/音质组合，均只返回试听片段${tail}`)
+  ;(err as any).code = 'PREVIEW_CLIP'
+  return err
+}
+
+/**
+ * 候选探测结论。
+ *
+ * - `ok`          码率配得上声称档位
+ * - `implausible` 低于该档位下限（如谎报 flac24bit 的 320k mp3）→ **降级排序**但保留作兜底
+ * - `preview`     低到不可能是一首歌（内容被截断）→ **硬拒绝**
+ * - `unknown`     拿不到响应头信息（无 Content-Length / 无时长 / 压缩传输）→ 不作判断
+ * - `error`       请求本身失败（HTTP 4xx/5xx）
+ */
+export type CandidateVerdict = 'ok' | 'implausible' | 'preview' | 'unknown' | 'error'
+
+export type CandidateProbe = {
+  verdict: CandidateVerdict
+  contentLength: number | null
+  estKbps: number | null
+  reason?: string
+}
+
+/**
+ * 只读响应头探测一个候选 URL —— **不消费 body**。
+ *
+ * 这是「择优下载」的主判据：`Content-Length ÷ 时长` 就能把真 Hi-Res（2372kbps）、
+ * 真无损（933kbps）、谎报的 320k（321kbps）、试听片段（34kbps）干净地分开，
+ * 而代价只是一次请求头。
+ */
+export async function probeCandidate(
+  url: string,
+  opts: {
+    expectedDurationSec: number | null
+    quality: string | null
+    signal?: AbortSignal
+    timeoutMs?: number
+  },
+): Promise<CandidateProbe> {
+  const timeoutMs = opts.timeoutMs ?? 20000
+  const ctrl = new AbortController()
+  const onAbort = () => ctrl.abort()
+  opts.signal?.addEventListener('abort', onAbort, { once: true })
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      headers: { 'User-Agent': 'miyin/0.1', Referer: 'https://www.google.com/' },
+    })
+    // 只读头：立刻取消 body，不下载内容
+    await res.body?.cancel().catch(() => {})
+    if (!res.ok) {
+      return { verdict: 'error', contentLength: null, estKbps: null, reason: `HTTP ${res.status}` }
+    }
+    // 压缩传输时 Content-Length 是压缩后大小，不能用来估码率
+    const encoding = res.headers.get('content-encoding')
+    if (encoding && encoding !== 'identity') {
+      return {
+        verdict: 'unknown',
+        contentLength: null,
+        estKbps: null,
+        reason: `内容被 ${encoding} 压缩，长度不可用于估码率`,
+      }
+    }
+    const raw = Number(res.headers.get('content-length') || 0)
+    const contentLength = raw > 0 ? raw : null
+    const estKbps = estimateBitrateKbps(contentLength, opts.expectedDurationSec)
+    if (estKbps == null) {
+      return {
+        verdict: 'unknown',
+        contentLength,
+        estKbps: null,
+        reason: contentLength == null ? '无 Content-Length' : '无已知时长',
+      }
+    }
+    if (estKbps < MIN_KBPS_ANY) {
+      return {
+        verdict: 'preview',
+        contentLength,
+        estKbps,
+        reason: `估算仅 ${Math.round(estKbps)}kbps，远低于任何档位`,
+      }
+    }
+    const plausibility = qualityPlausibility(estKbps, opts.quality)
+    if (plausibility === 'implausible') {
+      return {
+        verdict: 'implausible',
+        contentLength,
+        estKbps,
+        reason: `估算 ${Math.round(estKbps)}kbps 配不上声称的 ${opts.quality}`,
+      }
+    }
+    return { verdict: plausibility === 'ok' ? 'ok' : 'unknown', contentLength, estKbps }
+  } catch (err) {
+    return {
+      verdict: 'error',
+      contentLength: null,
+      estKbps: null,
+      reason: String((err as Error)?.message || err),
+    }
+  } finally {
+    clearTimeout(timer)
+    opts.signal?.removeEventListener('abort', onAbort)
+  }
 }

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import type { SwitchSourceOption } from '~/composables/useSwitchSourcePreference'
 import { matchesTrackKeyword } from '#shared/trackKey'
+import { PLAYLIST_PLATFORM_ORDER } from '#shared/platforms'
+import { QUALITY_LADDER } from '#shared/quality'
 
 type Task = {
   id: string
@@ -42,6 +44,29 @@ const searchInput = ref('')
 /** 已生效的检索关键词；作用域为当前 tab（服务端配合 tab 参数过滤） */
 const searchKeyword = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+/** 增强筛选：平台 / 音质 / 入队日期（与关键词、batch 过滤叠加） */
+const platformFilter = ref('')
+const qualityFilter = ref('')
+const sinceFilter = ref('')
+const untilFilter = ref('')
+/**
+ * 跨 tab 搜索时「查看分类」限定的分组。
+ * `null` = 不限定，结果覆盖所有分类；点某条结果的分类徽标即限定到该分类。
+ */
+const searchTabScope = ref<'running' | 'completed' | 'failed' | null>(null)
+/** 关键词检索默认跨 tab（需求要求），仅在用户点分类后才收窄 */
+const isCrossTabSearch = computed(() => !!searchKeyword.value && !searchTabScope.value)
+
+/** 任务状态 → 队列页分类 */
+function statusGroupOf(status: string): 'running' | 'completed' | 'failed' | null {
+  if (status === 'queued' || status === 'running') return 'running'
+  if (status === 'completed') return 'completed'
+  if (status === 'failed' || status === 'cancelled') return 'failed'
+  return null
+}
+const platformOptions = PLAYLIST_PLATFORM_ORDER.map((id) => ({ id, label: platformLabel(id) }))
+// 音质候选取自共享阶梯（含 192k）—— 用 UI 选项列表会漏掉 192k 的历史记录
+const qualityOptions = QUALITY_LADDER.map((q) => ({ id: q, label: qualityLabel(q) }))
 const toast = useToast()
 const deleteDialogOpen = ref(false)
 const deleteDialogTitle = ref('确认删除')
@@ -243,12 +268,6 @@ function onSwitchCancel() {
   switchPending = null
 }
 
-const statusMap = {
-  running: ['queued', 'running'],
-  completed: ['completed'],
-  failed: ['failed', 'cancelled'],
-}
-
 type ServerStats = {
   total: number
   completed: number
@@ -270,7 +289,14 @@ const tabCounts = computed(() => {
   return { running: 0, completed: 0, failed: 0 }
 })
 
+/** 跨 tab 搜索的命中总数（各分类之和） */
+const crossTabTotal = computed(
+  () => tabCounts.value.running + tabCounts.value.completed + tabCounts.value.failed,
+)
+
 const currentTabTotal = computed(() => {
+  // 跨 tab 搜索时「全选」的语义是所有命中，而非某一个分类
+  if (isCrossTabSearch.value) return crossTabTotal.value
   return tabCounts.value[tab.value] || 0
 })
 
@@ -310,17 +336,6 @@ function matchesKeyword(task: Task) {
   )
 }
 
-/**
- * 当前分类无结果时的跨分类提示。
- * 检索作用域仍是单个 tab（tab 角标随关键词收敛），此处仅消除"默认在「进行中」搜不到东西"的死路。
- */
-const crossTabHints = computed(() => {
-  if (!searchKeyword.value) return []
-  return (['running', 'completed', 'failed'] as const)
-    .filter((name) => name !== tab.value && tabCounts.value[name] > 0)
-    .map((name) => ({ tab: name, label: TAB_LABELS[name], count: tabCounts.value[name] }))
-})
-
 /** 立即清空检索（跳过 300ms 防抖） */
 function clearSearch() {
   if (searchTimer) {
@@ -329,6 +344,7 @@ function clearSearch() {
   }
   searchInput.value = ''
   searchKeyword.value = ''
+  searchTabScope.value = null
 }
 
 const selectedCount = computed(() => {
@@ -336,8 +352,92 @@ const selectedCount = computed(() => {
   return selected.value.size
 })
 
+/**
+ * 选中项归属的分类。
+ * - 单分类 → 该分类（批量操作按该分类语义执行）
+ * - `mixed` → 混合状态，批量语义不明，需先按分类限定
+ * - `null` → 未选中
+ */
+const selectedGroup = computed<'running' | 'completed' | 'failed' | 'mixed' | null>(() => {
+  if (selectAllState.value) return tab.value
+  const groups = new Set<string>()
+  for (const task of items.value) {
+    if (!selected.value.has(task.id)) continue
+    const group = statusGroupOf(task.status)
+    if (group) groups.add(group)
+  }
+  if (!groups.size) return null
+  return groups.size === 1 ? ([...groups][0] as 'running' | 'completed' | 'failed') : 'mixed'
+})
+
+/** 跨 tab 搜索的命中分布；也可点击直接限定到某分类 */
+const groupDistribution = computed(() =>
+  (['running', 'completed', 'failed'] as const)
+    .map((group) => ({ group, label: TAB_LABELS[group], count: tabCounts.value[group] }))
+    .filter((row) => row.count > 0),
+)
+
+/** 限定分类后无结果时，提示其它分类仍有命中 */
+const crossTabHints = computed(() => {
+  if (!searchKeyword.value || !searchTabScope.value) return []
+  return (['running', 'completed', 'failed'] as const)
+    .filter((name) => name !== searchTabScope.value && tabCounts.value[name] > 0)
+    .map((name) => ({ group: name, label: TAB_LABELS[name], count: tabCounts.value[name] }))
+})
+
+/** 限定搜索到某个分类（点结果条上的分类徽标） */
+function scopeToGroup(group: 'running' | 'completed' | 'failed') {
+  searchTabScope.value = group
+  tab.value = group
+}
+
+/** 取消分类限定，回到跨 tab 搜索 */
+function clearTabScope() {
+  searchTabScope.value = null
+  void loadTabItems({ reset: true })
+}
+
+/** 点结果条上的分类徽标 → 限定到该分类（等价于点对应 tab） */
+function scopeToStatus(status: string) {
+  const group = statusGroupOf(status)
+  if (group) scopeToGroup(group)
+}
+
+function groupLabelOf(status: string) {
+  const group = statusGroupOf(status)
+  return group ? TAB_LABELS[group] : ''
+}
+
+/**
+ * 切换分类。检索态下点 tab 等价于「把搜索结果限定到该分类」。
+ * tab 未变化时 `watch(tab)` 不会触发，需在 scope 确实变化时手动重载。
+ */
+function selectTab(next: 'running' | 'completed' | 'failed') {
+  const scopeChanged = !!searchKeyword.value && searchTabScope.value !== next
+  if (searchKeyword.value) searchTabScope.value = next
+  if (tab.value === next) {
+    if (scopeChanged) void loadTabItems({ reset: true })
+    return
+  }
+  tab.value = next
+}
+
 function clearBatchFilter() {
   void navigateTo({ path: '/queue', query: {} })
+}
+
+/** 手动刷新当前分类：用于 SSE 漏推或用户想确认最新状态 */
+const refreshing = ref(false)
+async function refreshCurrentTab() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    // reset 回到第 1 页并清空选中，同时会连带刷新 tab 角标与分类分布
+    await loadTabItems({ reset: true })
+    toast.success(isCrossTabSearch.value ? '已刷新搜索结果' : '已刷新当前分类')
+  } finally {
+    refreshing.value = false
+  }
 }
 
 function formatSize(n: number | null | undefined) {
@@ -395,23 +495,53 @@ function sortRunningItems(list: Task[]): Task[] {
   })
 }
 
-function downloadListParams(page: number) {
-  const params: Record<string, string | number> = {
-    tab: tab.value,
-    page,
-    pageSize: PAGE_SIZE,
-  }
+/** 「清理重复」弹窗（C4）：入队判重拦不住判重引入之前的历史重复，这里事后清理 */
+const cleanupDialogOpen = ref(false)
+
+/** 列表与统计共用的过滤条件；两处必须一致，否则分页 total 会按全量算 */
+function activeFilterParams() {
+  const params: Record<string, string> = {}
   if (batchFilter.value) params.batch_id = batchFilter.value
   if (searchKeyword.value) params.q = searchKeyword.value
+  if (platformFilter.value) params.platform = platformFilter.value
+  if (qualityFilter.value) params.quality = qualityFilter.value
+  if (sinceFilter.value) params.since = sinceFilter.value
+  if (untilFilter.value) params.until = untilFilter.value
   return params
+}
+
+const hasActiveFilters = computed(
+  () => !!(searchKeyword.value || platformFilter.value || qualityFilter.value || sinceFilter.value || untilFilter.value),
+)
+
+function clearFilters() {
+  clearSearch()
+  platformFilter.value = ''
+  qualityFilter.value = ''
+  sinceFilter.value = ''
+  untilFilter.value = ''
+}
+
+/** 清理重复后同步刷新列表与角标 */
+async function onCleanupDeleted() {
+  await loadTabItems({ silent: true, reset: true })
+  notifyChanged()
+}
+
+function downloadListParams(page: number) {
+  return {
+    // 跨 tab 搜索时不传 tab，让结果覆盖所有分类（服务端按 scope=all 处理）
+    ...(isCrossTabSearch.value ? { scope: 'all' as const } : { tab: tab.value }),
+    page,
+    pageSize: PAGE_SIZE,
+    ...activeFilterParams(),
+  }
 }
 
 async function fetchStats() {
   try {
-    // 统计与列表使用同一组过滤条件，检索时 tab 角标随之收敛
-    const params: Record<string, string> = {}
-    if (batchFilter.value) params.batch_id = batchFilter.value
-    if (searchKeyword.value) params.q = searchKeyword.value
+    // 统计与列表使用同一组过滤条件，筛选时 tab 角标随之收敛
+    const params = activeFilterParams()
     const res = await $fetch<ServerStats>('/api/downloads/stats', {
       params: Object.keys(params).length ? params : undefined,
     })
@@ -458,7 +588,8 @@ async function loadTabItems(opts?: { silent?: boolean; reset?: boolean }) {
     ])
     const newItems = res.items || []
     if (currentPage.value === 1) {
-      items.value = tab.value === 'running' ? sortRunningItems(newItems) : newItems
+      // 跨 tab 搜索结果混合了各分类，不能按「进行中」的排序规则重排
+      items.value = !isCrossTabSearch.value && tab.value === 'running' ? sortRunningItems(newItems) : newItems
     } else {
       const existingIds = new Set(items.value.map((t) => t.id))
       const uniqueNew = newItems.filter((t) => !existingIds.has(t.id))
@@ -503,12 +634,13 @@ function upsert(task: Task) {
   const statusChanged = isDeleted || !prev || prev.status !== task.status
   if (statusChanged) scheduleFetchStats()
 
-  const allowed = statusMap[tab.value]
+  const group = statusGroupOf(task.status)
   const belongsToBatch = !batchFilter.value || task.batch_id === batchFilter.value
   // 检索态下，推送来的任务也必须命中关键词，否则会污染搜索结果列表
   const belongsToKeyword = matchesKeyword(task)
-  const belongsToTab =
-    !isDeleted && belongsToBatch && belongsToKeyword && allowed.includes(task.status)
+  // 跨 tab 搜索：任意分类的任务都属于当前结果集；否则按当前分类过滤
+  const inScope = isCrossTabSearch.value ? group !== null : group === tab.value
+  const belongsToTab = !isDeleted && belongsToBatch && belongsToKeyword && inScope
 
   const idx = items.value.findIndex((t) => t.id === task.id)
   if (isDeleted) {
@@ -521,14 +653,15 @@ function upsert(task: Task) {
   if (belongsToTab) {
     if (idx >= 0) {
       items.value[idx] = task
-    } else if (tab.value === 'running') {
+    } else if (isCrossTabSearch.value || tab.value === 'running') {
+      // 跨 tab 搜索的新命中直接追加；「进行中」按原有逻辑追加
       items.value.push(task)
     }
-    if (tab.value === 'running') {
+    if (!isCrossTabSearch.value && tab.value === 'running') {
       items.value = sortRunningItems(items.value)
     }
   } else {
-    // 状态变迁（例如 running -> completed），从当前 tab 列表中移除
+    // 状态变迁（例如 running -> completed），从当前列表移除
     if (idx >= 0) {
       items.value.splice(idx, 1)
       selected.value.delete(task.id)
@@ -684,7 +817,7 @@ async function deleteOne(t: Task) {
 
 async function batchDelete() {
   if (!selectedCount.value) return
-  const label = tab.value === 'failed' ? '失败/取消' : '已完成'
+  const label = selectedGroup.value === 'failed' ? '失败/取消' : '已完成'
   deletePending = { mode: 'batch' }
   deleteDialogTitle.value = '批量删除'
   deleteDialogDesc.value = selectAllState.value
@@ -716,7 +849,10 @@ async function onDeleteConfirm(payload: { deleteLocalFiles: boolean }) {
         method: 'POST',
         body: {
           ids: selectAllState.value ? undefined : [...selected.value],
-          allWithTab: selectAllState.value ? (tab.value as 'completed' | 'failed') : undefined,
+          // selectAllState 仅在非跨 tab 搜索时可用，此时 selectedGroup 恒等于当前分类
+          allWithTab: selectAllState.value
+            ? (selectedGroup.value as 'completed' | 'failed')
+            : undefined,
           deleteLocalFiles: payload.deleteLocalFiles,
         },
       })
@@ -822,6 +958,11 @@ watch(searchKeyword, () => {
   selectAllState.value = false
   void loadTabItems({ reset: true })
 })
+watch([platformFilter, qualityFilter, sinceFilter, untilFilter], () => {
+  selected.value = new Set()
+  selectAllState.value = false
+  void loadTabItems({ reset: true })
+})
 const showPageLoading = computed(() => pageLoading.value || loading.value)
 
 onMounted(() => {
@@ -859,12 +1000,45 @@ useRegisterPageRefresh(async () => {
 <template>
   <div class="page page-queue">
     <PageLoading :show="showPageLoading" :text="loadingText" />
+    <div class="search-bar">
+      <input
+        v-model="searchInput"
+        class="search-input"
+        type="search"
+        :placeholder="
+          searchTabScope
+            ? `检索「${TAB_LABELS[searchTabScope]}」：歌手 / 歌名 / 专辑`
+            : '检索全部分类：歌手 / 歌名 / 专辑'
+        "
+        aria-label="检索下载记录"
+        autocomplete="off"
+      />
+      <button v-if="searchInput" class="link-btn" type="button" @click="clearSearch">清空</button>
+    </div>
+
+    <div class="filter-bar">
+      <select v-model="platformFilter" class="filter-select" aria-label="平台筛选">
+        <option value="">全部平台</option>
+        <option v-for="p in platformOptions" :key="p.id" :value="p.id">{{ p.label }}</option>
+      </select>
+      <select v-model="qualityFilter" class="filter-select" aria-label="音质筛选">
+        <option value="">全部音质</option>
+        <option v-for="q in qualityOptions" :key="q.id" :value="q.id">{{ q.label }}</option>
+      </select>
+      <!-- <input v-model="sinceFilter" class="filter-date" type="date" aria-label="入队起始日期" />
+      <span class="muted">—</span>
+      <input v-model="untilFilter" class="filter-date" type="date" aria-label="入队结束日期" /> -->
+      <button v-if="hasActiveFilters" class="link-btn" type="button" @click="clearFilters">
+        清除筛选
+      </button>
+    </div>
+
     <div class="tabs">
       <button
         type="button"
         class="tab"
-        :class="{ active: tab === 'running' }"
-        @click="tab = 'running'"
+        :class="{ active: tab === 'running' && !isCrossTabSearch }"
+        @click="selectTab('running')"
       >
         进行中
         <span class="tab-count">
@@ -877,28 +1051,24 @@ useRegisterPageRefresh(async () => {
       <button
         type="button"
         class="tab"
-        :class="{ active: tab === 'completed' }"
-        @click="tab = 'completed'"
+        :class="{ active: tab === 'completed' && !isCrossTabSearch }"
+        @click="selectTab('completed')"
       >
         已完成
         <span class="tab-count">({{ tabCounts.completed }})</span>
       </button>
-      <button type="button" class="tab" :class="{ active: tab === 'failed' }" @click="tab = 'failed'">
+      <button
+        type="button"
+        class="tab"
+        :class="{ active: tab === 'failed' && !isCrossTabSearch }"
+        @click="selectTab('failed')"
+      >
         失败
         <span class="tab-count">({{ tabCounts.failed }})</span>
       </button>
-    </div>
-
-    <div class="search-bar">
-      <input
-        v-model="searchInput"
-        class="search-input"
-        type="search"
-        placeholder="检索当前分类：歌手 / 歌名 / 专辑"
-        aria-label="检索下载记录"
-        autocomplete="off"
-      />
-      <button v-if="searchInput" class="link-btn" type="button" @click="clearSearch">清空</button>
+      <span v-if="isCrossTabSearch" class="tab-scope-hint muted">
+        搜索中 · 跨全部分类（{{ crossTabTotal }} 条）
+      </span>
     </div>
 
     <p v-if="batchFilter" class="batch-filter-bar">
@@ -906,28 +1076,71 @@ useRegisterPageRefresh(async () => {
       <button class="link-btn" type="button" @click="clearBatchFilter">显示全部</button>
     </p>
 
+    <p v-if="isCrossTabSearch && groupDistribution.length > 1" class="scope-bar">
+      归属分类：
+      <button
+        v-for="row in groupDistribution"
+        :key="row.group"
+        class="link-btn"
+        type="button"
+        @click="scopeToGroup(row.group)"
+      >
+        {{ row.label }}（{{ row.count }}）
+      </button>
+      <span class="muted">点分类可限定后继续操作</span>
+    </p>
+
+    <p v-else-if="searchTabScope" class="scope-bar">
+      已限定在「{{ TAB_LABELS[searchTabScope] }}」
+      <button class="link-btn" type="button" @click="clearTabScope">显示全部分类</button>
+    </p>
+
     <div class="toolbar">
-      <label class="check">
+      <label class="check" :title="isCrossTabSearch ? '跨分类搜索结果不支持全选，请先点分类限定' : ''">
         <input
           type="checkbox"
-          :checked="selectAllState || (items.length > 0 && selected.size === currentTabTotal)"
-          :disabled="!items.length"
+          :checked="selectAllState || (!isCrossTabSearch && items.length > 0 && selected.size === currentTabTotal)"
+          :disabled="!items.length || isCrossTabSearch"
           @change="toggleSelectAll"
         />
-        <span>全选{{ currentTabTotal > 0 ? ` (${currentTabTotal})` : '' }}</span>
+        <span>
+          {{ isCrossTabSearch ? '跨分类（不支持全选）' : `全选${currentTabTotal > 0 ? ` (${currentTabTotal})` : ''}` }}
+        </span>
       </label>
+      <button
+        class="btn btn-ghost btn-sm refresh-btn"
+        type="button"
+        :disabled="loading || refreshing"
+        :title="isCrossTabSearch ? '刷新搜索结果（跨全部分类）' : `刷新「${TAB_LABELS[tab]}」的数据`"
+        @click="refreshCurrentTab"
+      >
+        {{ refreshing ? '刷新中…' : '刷新' }}
+      </button>
+      <button
+        class="btn btn-ghost btn-sm"
+        type="button"
+        :disabled="loading"
+        @click="cleanupDialogOpen = true"
+      >
+        清理重复
+      </button>
       <template v-if="selectedCount">
-        <template v-if="tab === 'running'">
+        <template v-if="selectedGroup === 'mixed'">
+          <span class="muted mixed-hint">
+            选中的任务分属不同分类，批量操作语义不明确 —— 请先点上方分类限定
+          </span>
+        </template>
+        <template v-else-if="selectedGroup === 'running'">
           <button class="btn btn-danger btn-sm" type="button" :disabled="loading" @click="batchCancel">
             批量取消（{{ selectedCount }}）
           </button>
         </template>
-        <template v-else-if="tab === 'completed'">
+        <template v-else-if="selectedGroup === 'completed'">
           <button class="btn btn-danger btn-sm" type="button" :disabled="loading" @click="batchDelete">
             批量删除（{{ selectedCount }}）
           </button>
         </template>
-        <template v-else>
+        <template v-else-if="selectedGroup === 'failed'">
           <div class="toolbar-actions">
             <button class="btn btn-sm" type="button" :disabled="loading" @click="batchRetry">
               批量重试（{{ selectedCount }}）
@@ -995,7 +1208,19 @@ useRegisterPageRefresh(async () => {
                     </template>
                   </span>
                 </div>
-                <span class="badge" :class="`badge-${t.status}`">{{ statusText(t.status) }}</span>
+                <button
+                  v-if="isCrossTabSearch && statusGroupOf(t.status)"
+                  class="badge badge-btn"
+                  :class="`badge-${t.status}`"
+                  type="button"
+                  :title="`只看「${groupLabelOf(t.status)}」`"
+                  @click="scopeToStatus(t.status)"
+                >
+                  {{ statusText(t.status) }}
+                </button>
+                <span v-else class="badge" :class="`badge-${t.status}`">
+                  {{ statusText(t.status) }}
+                </span>
               </div>
 
               <div class="task-meta">
@@ -1076,17 +1301,23 @@ useRegisterPageRefresh(async () => {
       </VirtualList>
       <div v-else class="empty">
         <p class="muted">
-          {{ searchKeyword ? `没有匹配「${searchKeyword}」的记录` : '当前分类没有任务' }}
+          <template v-if="searchKeyword">
+            <template v-if="searchTabScope">
+              「{{ TAB_LABELS[searchTabScope] }}」中没有匹配「{{ searchKeyword }}」的记录
+            </template>
+            <template v-else>全部分类中没有匹配「{{ searchKeyword }}」的记录</template>
+          </template>
+          <template v-else>当前分类没有任务</template>
         </p>
-        <template v-if="searchKeyword && crossTabHints.length">
+        <template v-if="crossTabHints.length">
           <p class="muted hint-line">其他分类中有匹配：</p>
           <p class="hint-line">
             <button
               v-for="h in crossTabHints"
-              :key="h.tab"
+              :key="h.group"
               class="link-btn"
               type="button"
-              @click="tab = h.tab"
+              @click="scopeToGroup(h.group)"
             >
               在「{{ h.label }}」中有 {{ h.count }} 条
             </button>
@@ -1094,6 +1325,8 @@ useRegisterPageRefresh(async () => {
         </template>
       </div>
     </div>
+
+    <DuplicateCleanupDialog v-model:open="cleanupDialogOpen" @deleted="onCleanupDeleted" />
 
     <DeleteConfirmDialog
       v-model:open="deleteDialogOpen"
@@ -1286,6 +1519,53 @@ useRegisterPageRefresh(async () => {
   background: hsl(var(--muted-bg));
   color: var(--muted);
 }
+.badge-btn {
+  border: none;
+  font-family: inherit;
+  cursor: pointer;
+  opacity: 0.95;
+}
+.badge-btn:hover {
+  opacity: 1;
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 30%, transparent);
+}
+.tab-scope-hint {
+  margin-left: auto;
+  align-self: center;
+  font-size: 12px;
+  white-space: nowrap;
+}
+.scope-bar {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--muted);
+  background: color-mix(in oklab, var(--accent) 10%, transparent);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.scope-bar .muted {
+  font-size: 12px;
+}
+.mixed-hint {
+  font-size: 12px;
+}
+.refresh-icon {
+  display: inline-block;
+  margin-right: 4px;
+  line-height: 1;
+}
+.refresh-icon.spinning {
+  animation: refresh-spin 0.9s linear infinite;
+}
+@keyframes refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .badge-running {
   background: var(--accent-soft);
   color: var(--accent);
@@ -1414,6 +1694,32 @@ useRegisterPageRefresh(async () => {
   outline: none;
   border-color: var(--accent);
 }
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.filter-select,
+.filter-date {
+  padding: 6px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.filter-date {
+  min-width: 128px;
+}
+.filter-select:focus,
+.filter-date:focus {
+  outline: none;
+  border-color: var(--accent);
+}
 .task-title mark {
   background: color-mix(in oklab, var(--accent) 26%, transparent);
   color: inherit;
@@ -1453,7 +1759,7 @@ useRegisterPageRefresh(async () => {
   }
   .toolbar .btn,
   .toolbar-actions .btn {
-    flex: 1 1 calc(50% - 4px);
+    flex: 1 1 calc(25% - 4px);
     min-width: 0;
   }
   .task {
@@ -1466,10 +1772,17 @@ useRegisterPageRefresh(async () => {
     justify-content: flex-start;
   }
   .task-ops .btn {
-    min-height: 36px;
+    min-height: 32px;
   }
   .progress {
     max-width: none;
+  }
+  .btn-sm {
+    padding: 2px 10px;
+    min-height: 32px;
+  }
+  .filter-select {
+    min-width: 120px;
   }
 }
 

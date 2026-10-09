@@ -25,16 +25,29 @@ import { closeDb, getDb } from '../server/utils/db'
 // 受控的取链挂起：允许测试在任务 running 期间执行取消，再放行取链结果
 const deferred = vi.hoisted(() => {
   const d: {
-    resolve?: (v: { url: string; quality: string; sourceId: string; sourceName: string }) => void
+    resolve?: (v: {
+      candidates: Array<{ url: string; quality: string; sourceId: string; sourceName: string }>
+      errors: string[]
+      loadedCount: number
+      excludedSkips: number
+      truncated: boolean
+    }) => void
   } = {}
   return d
 })
 
 vi.mock('../server/services/musicUrlResolve', () => ({
   isHighestQuality: (pref?: string | null) => !pref || pref === 'highest',
-  resolveMusicUrl: vi.fn(
+  // 取链整体挂起，直到测试放行 —— 模拟"取链结果迟到"
+  listMusicUrlCandidates: vi.fn(
     () =>
-      new Promise<{ url: string; quality: string; sourceId: string; sourceName: string }>((resolve) => {
+      new Promise<{
+        candidates: Array<{ url: string; quality: string; sourceId: string; sourceName: string }>
+        errors: string[]
+        loadedCount: number
+        excludedSkips: number
+        truncated: boolean
+      }>((resolve) => {
         deferred.resolve = resolve
       }),
   ),
@@ -99,7 +112,21 @@ describe('downloadQueue cancelled 为终结态（BUG-02 守护）', () => {
     expect(cancelled.status).toBe('cancelled')
 
     // 放行迟到的取链结果：processTask 必须在 abort 检查处中止，不得写 completed
-    deferred.resolve?.({ url: 'http://example.com/night.flac', quality: 'flac', sourceId: 'test-source-1', sourceName: '测试音源' })
+    // （abort 检查位于候选循环的第一步，因此不会真的去探测/下载）
+    deferred.resolve?.({
+      candidates: [
+        {
+          url: 'http://example.com/night.flac',
+          quality: 'flac',
+          sourceId: 'test-source-1',
+          sourceName: '测试音源',
+        },
+      ],
+      errors: [],
+      loadedCount: 1,
+      excludedSkips: 0,
+      truncated: false,
+    })
     await waitUntil(3000, () => false) // 给足事件循环时间让 processTask 走完 catch 分支
 
     const finalTask = getTask(task.id)

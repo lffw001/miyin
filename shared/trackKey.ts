@@ -1,12 +1,15 @@
 /**
  * 曲库检索能力层的归一化原语。
  *
- * 两个键服务不同目的，归一化规则**故意不同**：
- * - `dedupKey`   判身份：严格归一化，**去除括号及其内容** → 入队判重用（`稻香 (Live)` ≡ `稻香`）
- * - `searchText` 保可达性：基础归一化 + 去标点、**保留**括号内容 → 历史检索用
- *   （子串匹配天然让「稻香」命中「稻香(Live)」，保留后还能用「live」搜到现场版）
+ * 三个消费方服务不同目的，归一化规则**故意不同**，不要合并：
+ * - `normalizeForDedup` 判身份：只做基础归一化，**保留括号内容** → 入队判重用
+ *   （**允许同曲多版本共存**：`稻香` ≠ `稻香 (Live)` ≠ `稻香（Demo）`）
+ * - `normalizeForMatch` 模糊匹配：基础归一化 + **去除括号内容** → `trackMatcher` 打分用
+ *   （歌单里写「稻香」要能匹配到「稻香 (Live)」这类候选）
+ * - `normalizeSearchToken` 保可达性：基础归一化 + 去标点、**保留**括号内容 → 历史检索用
+ *   （保留后能用「live」搜到现场版；子串匹配天然让「稻香」命中「稻香(Live)」）
  *
- * 两者共用 `normalizeText()` 作为底座，因此不会出现两套"差不多但不一致"的归一化逻辑。
+ * 三者共用 `normalizeText()` 作为底座，因此不会出现两套"差不多但不一致"的归一化逻辑。
  */
 
 /** 字段分隔符（Unit Separator）：避免 title / artist 拼接产生跨字段误命中 */
@@ -32,12 +35,27 @@ export function normalizeText(input: string) {
 }
 
 /**
- * 判重归一化：基础归一化 + 去除括号及其内容。
+ * 判重归一化：**只做基础归一化，保留括号及其内容**。
  *
- * **已确认口径**：`稻香 (Live)` 与 `稻香` 判为相同曲。
- * 与 `server/services/trackMatcher.ts` 的 `norm()` 行为一致（后者直接复用本函数）。
+ * **口径（2026-10-09 修订）**：允许同一首歌的多个版本共存。
+ * `稻香` / `稻香 (Live)` / `稻香（Demo）` / `稻香（钢琴版）` 是**不同的键** → 不判重、互不覆盖。
+ *
+ * 全角/半角与空格差异仍会被归一，因此 `稻香（Live）` ≡ `稻香 (Live)`（同一个版本）。
+ *
+ * ⚠️ 早期版本（v1）会去除括号内容，导致 `稻香 (Live)` 被判为与 `稻香` 相同 —— 已废弃。
+ * 口径变更由 `server/utils/db.ts` 的 `DEDUP_KEY_VERSION` 负责让旧键整体失效重算。
  */
 export function normalizeForDedup(input: string) {
+  return normalizeText(input)
+}
+
+/**
+ * 模糊匹配归一化：基础归一化 + **去除括号及其内容**。
+ *
+ * 供 `trackMatcher` 打分使用 —— 歌单里裸写「稻香」应当能匹配到「稻香 (Live)」这类候选。
+ * 与判重口径**故意不同**：判重要求版本精确，匹配要求召回宽松。
+ */
+export function normalizeForMatch(input: string) {
   return normalizeText(input).replace(/[（(].*?[）)]/g, '')
 }
 
@@ -55,16 +73,13 @@ export function primaryArtist(artist: string) {
 }
 
 /**
- * 判重键：主歌手 + 标题。
+ * 判重键：主歌手 + 标题（均保留括号内容）。
  *
- * 标题去括号后为空时（如 `（伴奏）`）回退到保留括号的形态，
- * 否则同歌手的 `稻香（伴奏）` 与 `晴天（伴奏）` 会双双归一为「歌手 + 空」而互相误判。
  * 双字段都为空时返回 `''`，调用方应视为「无判重键」并跳过判重。
  */
 export function buildDedupKey(artist: string, title: string) {
   const a = normalizeForDedup(primaryArtist(artist))
-  const strippedTitle = normalizeForDedup(title)
-  const t = strippedTitle || normalizeText(title)
+  const t = normalizeForDedup(title)
   if (!a && !t) return ''
   return `${a}${FIELD_SEP}${t}`
 }

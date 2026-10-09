@@ -45,3 +45,22 @@ export function sniffAudioExt(filePath: string): string | null {
 
   return null
 }
+
+/** 声明为无损的档位 */
+const LOSSLESS_CLAIMS = new Set(['flac', 'flac24bit'])
+
+/**
+ * 「声称无损、实际有损」判定。
+ *
+ * **只认 mp3**：m4a 容器里可能是 ALAC（无损），ogg 可能是无损，都无法从魔数区分，
+ * 判了会有误杀。mp3 是唯一能确定是"冒充"的情况 —— 也正是实际遇到的那种
+ * （某音源声称 flac24bit，实测 321kbps，内容为 mp3）。
+ */
+export function isLosslessClaimMismatch(
+  claimed: string | null | undefined,
+  sniffedExt: string | null,
+): boolean {
+  if (!claimed || !sniffedExt) return false
+  if (!LOSSLESS_CLAIMS.has(claimed)) return false
+  return sniffedExt === 'mp3'
+}

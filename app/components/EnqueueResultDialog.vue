@@ -5,12 +5,25 @@ export type EnqueueResultItem = {
   method?: string
   error?: string
   taskId?: string
+  /** 因疑似重复被跳过（不入库，不算失败） */
+  skipped?: boolean
+  /** 命中的既有记录信息（skipped / replaced 时存在） */
+  duplicate?: {
+    reason?: string
+    existing?: { title?: string; artist?: string; quality?: string | null } | null
+  }
+  /** 更新了既有记录并重新下载 */
+  replaced?: boolean
 }
 
 export type EnqueueResultPayload = {
   enqueued: number
   total: number
   batchId?: string
+  /** 因疑似重复被跳过的条数 */
+  skipped?: number
+  /** 替换既有记录的条数 */
+  replaced?: number
   results?: EnqueueResultItem[]
 }
 
@@ -34,9 +47,13 @@ const emit = defineEmits<{
 }>()
 
 const items = computed(() => props.result?.results || [])
-const failedItems = computed(() => items.value.filter((x) => !x.ok))
+/** 跳过 ≠ 失败：疑似重复被跳过的条目不计入失败，也不参与「重试失败」 */
+const skippedItems = computed(() => items.value.filter((x) => x.skipped))
+const replacedItems = computed(() => items.value.filter((x) => x.replaced))
+const failedItems = computed(() => items.value.filter((x) => !x.ok && !x.skipped))
 const failCount = computed(() => {
   if (!props.result) return 0
+  if (props.result.results?.length) return failedItems.value.length
   return Math.max(0, props.result.total - props.result.enqueued)
 })
 
@@ -54,9 +71,21 @@ const failureGroups = computed(() => {
 const summaryText = computed(() => {
   if (!props.result) return ''
   const { enqueued, total } = props.result
+  const extra = [
+    skippedItems.value.length ? `跳过 ${skippedItems.value.length}` : '',
+    replacedItems.value.length ? `替换 ${replacedItems.value.length}` : '',
+  ]
+    .filter(Boolean)
+    .join('，')
+  const tail = extra ? `（${extra}）` : ''
   if (enqueued >= total && total > 0) return `已成功入队全部 ${enqueued} 首`
-  if (enqueued === 0) return `未能入队（0 / ${total}）`
-  return `成功入队 ${enqueued} / ${total} 首` + (failCount.value ? `，失败 ${failCount.value}` : '')
+  if (enqueued === 0) {
+    if (skippedItems.value.length && !failCount.value) {
+      return `${skippedItems.value.length} 首疑似重复已跳过${tail}`
+    }
+    return `未能入队（0 / ${total}）${tail}`
+  }
+  return `成功入队 ${enqueued} / ${total} 首` + (failCount.value ? `，失败 ${failCount.value}` : '') + tail
 })
 function onClose() {
   open.value = false
@@ -101,6 +130,18 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
           <p id="enqueue-result-desc" class="desc">{{ summaryText }}</p>
         </div>
 
+        <div v-if="skippedItems.length" class="skip-groups" aria-label="疑似重复已跳过">
+          <p class="skip-reason">疑似重复，已跳过（{{ skippedItems.length }} 首）</p>
+          <ul class="fail-titles">
+            <li v-for="(row, i) in skippedItems" :key="i">
+              {{ row.title }}
+              <span v-if="row.duplicate?.existing" class="muted">
+                ｜已有：{{ row.duplicate.existing.title }}
+              </span>
+            </li>
+          </ul>
+        </div>
+
         <div v-if="failureGroups.length" class="fail-groups" aria-label="失败汇总">
           <div v-for="g in failureGroups" :key="g.reason" class="fail-group">
             <p class="fail-reason">{{ g.reason }}（{{ g.rows.length }} 首）</p>
@@ -112,7 +153,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 
         <div v-if="items.length" class="list" aria-label="入队明细">
           <div v-for="(item, i) in items" :key="i" class="result-row">
-            <span class="mark" :class="item.ok ? 'ok' : 'err'">{{ item.ok ? '✓' : '✗' }}</span>
+            <span class="mark" :class="item.skipped ? 'skip' : item.ok ? 'ok' : 'err'">
+              {{ item.skipped ? '–' : item.ok ? '✓' : '✗' }}
+            </span>
             <div class="result-body">
               <span class="result-title">{{ item.title }}</span>
               <span v-if="item.method || item.error" class="result-meta">
@@ -244,6 +287,25 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKeydown))
 }
 .mark.ok {
   color: var(--accent);
+}
+.mark.skip {
+  color: var(--muted);
+}
+.skip-groups {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--muted) 8%, var(--bg));
+  max-height: 120px;
+  overflow: auto;
+}
+.skip-reason {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
 }
 .mark.err,
 .err {

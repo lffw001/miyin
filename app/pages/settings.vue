@@ -12,6 +12,9 @@ type Settings = {
   albumFolderTemplate: string
   autoFailover: boolean
   maxAttempts: number
+  duplicateCheckEnabled: boolean
+  duplicatePolicy: 'prompt' | 'skip' | 'replace'
+  duplicateProtectQuality: boolean
   nameTemplateVars?: Array<{ key: string; desc: string }>
   albumFolderTemplateVars?: Array<{ key: string; desc: string }>
   ffmpegAvailable?: boolean
@@ -30,6 +33,9 @@ const form = reactive<Settings>({
   albumFolderTemplate: '{album}',
   autoFailover: true,
   maxAttempts: 3,
+  duplicateCheckEnabled: true,
+  duplicatePolicy: 'prompt',
+  duplicateProtectQuality: true,
 })
 const templateVars = ref<Array<{ key: string; desc: string }>>([])
 const albumFolderVars = ref<Array<{ key: string; desc: string }>>([])
@@ -133,6 +139,9 @@ async function load() {
       albumFolderTemplate: res.albumFolderTemplate || '{album}',
       autoFailover: res.autoFailover,
       maxAttempts: res.maxAttempts,
+      duplicateCheckEnabled: res.duplicateCheckEnabled ?? true,
+      duplicatePolicy: res.duplicatePolicy || 'prompt',
+      duplicateProtectQuality: res.duplicateProtectQuality ?? true,
     })
     templateVars.value = res.nameTemplateVars || []
     albumFolderVars.value = res.albumFolderTemplateVars || []
@@ -264,6 +273,9 @@ async function save() {
         albumFolderTemplate: form.albumFolderTemplate.trim() || '{album}',
         autoFailover: form.autoFailover,
         maxAttempts: form.maxAttempts,
+        duplicateCheckEnabled: form.duplicateCheckEnabled,
+        duplicatePolicy: form.duplicatePolicy,
+        duplicateProtectQuality: form.duplicateProtectQuality,
       },
     })
     Object.assign(form, res)
@@ -480,6 +492,37 @@ useRegisterPageRefresh(async () => {
         <input v-model="form.autoFailover" type="checkbox" />
         失败自动换源
       </label>
+
+      <hr class="divider" />
+
+      <label class="check">
+        <input v-model="form.duplicateCheckEnabled" type="checkbox" />
+        入队前检查是否已下载过同一首歌
+      </label>
+
+      <template v-if="form.duplicateCheckEnabled">
+        <label>
+          <span>发现重复时</span>
+          <select v-model="form.duplicatePolicy" class="select">
+            <option value="prompt">每次询问（弹窗里选替换或跳过）</option>
+            <option value="skip">自动跳过</option>
+            <option value="replace">自动替换既有文件</option>
+          </select>
+          <p class="hint">
+            在弹窗中点过「不再提醒」会切到「自动跳过」，想恢复询问就选回「每次询问」。
+          </p>
+        </label>
+
+        <label class="check">
+          <input v-model="form.duplicateProtectQuality" type="checkbox" />
+          避免用更低的音质覆盖已有的高音质文件
+        </label>
+        <p class="hint">
+          勾选后，音质会比已有文件更低的曲目一律跳过（无论上面选的是询问还是自动替换）。
+          音质档位未知时不做判断。
+        </p>
+      </template>
+
       <p v-if="formError" class="err">{{ formError }}</p>
       <button class="btn" type="submit" :disabled="loading">保存</button>
     </form>
@@ -733,6 +776,11 @@ useRegisterPageRefresh(async () => {
   margin: 0 0 12px;
   font-size: 12px;
   color: var(--muted);
+}
+.divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0 12px;
 }
 .auth-hint code {
   color: var(--accent);

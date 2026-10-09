@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { buildDedupKey } from '#shared/trackKey'
+
 export type SearchTrack = {
   id: string
   externalId: string
@@ -24,6 +26,11 @@ const props = withDefaults(
     enqueueing?: boolean
     /** 超过该数量需二次确认，防止误选几百首瞬间打满音源并发 */
     confirmThreshold?: number
+    /**
+     * 「已在库」徽标（C3）：命中下载记录的 `dedupKey` 集合。
+     * 父级一次性预检后下传，行内 O(1) 判定，不逐行发请求。
+     */
+    libraryKeys?: Set<string>
   }>(),
   {
     selectedId: null,
@@ -31,8 +38,14 @@ const props = withDefaults(
     loadingMore: false,
     enqueueing: false,
     confirmThreshold: 100,
+    libraryKeys: () => new Set<string>(),
   },
 )
+
+/** 判定复用 shared/trackKey，与服务端判重口径严格一致 */
+function inLibrary(item: SearchTrack) {
+  return props.libraryKeys.has(buildDedupKey(item.artist, item.title))
+}
 
 const emit = defineEmits<{
   select: [item: SearchTrack]
@@ -170,7 +183,12 @@ onBeforeUnmount(clearConfirmTimer)
           </label>
           <CoverImage :src="item.cover" class="cover" :alt="item.title" />
           <div class="meta">
-            <div class="title">{{ item.title }}</div>
+            <div class="title">
+              {{ item.title }}
+              <span v-if="inLibrary(item)" class="lib-badge" title="下载记录中已存在同一首歌">
+                已在库
+              </span>
+            </div>
             <div class="muted">{{ item.artist }} · {{ fmtDur(item.duration) }}</div>
           </div>
         </div>
@@ -250,6 +268,18 @@ onBeforeUnmount(clearConfirmTimer)
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.lib-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.5;
+  vertical-align: middle;
+  border-radius: 4px;
+  color: var(--accent);
+  background: color-mix(in oklab, var(--accent) 14%, transparent);
 }
 .meta .muted {
   font-size: 12px;

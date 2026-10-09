@@ -23,10 +23,16 @@ export type MatchResult = {
   candidates: Array<MatchCandidate & { score: number }>
 }
 
-import { normalizeForDedup } from '#shared/trackKey'
+import { normalizeForMatch } from '#shared/trackKey'
 
-/** 元数据比对用的归一化：与判重键共用同一实现，避免两套"差不多但不一致"的归一化 */
-const norm = normalizeForDedup
+/**
+ * 元数据比对用的归一化：**去括号**以获得宽松召回。
+ *
+ * ⚠️ 与判重口径**故意不同** —— 判重用 `normalizeForDedup`（保留括号，版本精确）。
+ * 不要改成同一个：`tests/trackMatcher.test.ts` 有一条回归用例依赖
+ * 「全括号标题（`（伴奏）`）归一为空串」，否则它会靠歌手分蒙混过关。
+ */
+const norm = normalizeForMatch
 
 function scoreMeta(track: MatchInput, cand: MatchCandidate) {
   let score = 0
