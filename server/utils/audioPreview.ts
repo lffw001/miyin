@@ -75,12 +75,75 @@ export function minFullTrackBytes(expectedSec: number, qualityHint?: string | nu
   return Math.floor(expectedSec * 0.5 * ((kbps * 1000) / 8))
 }
 
-export function probeAudioDurationSeconds(filePath: string): Promise<number | null> {
+/** ffprobe 实测出的音频参数（L3 用） */
+export type AudioProbeInfo = {
+  durationSec: number | null
+  codec: string | null
+  sampleRate: number | null
+  bitsPerRawSample: number | null
+  channels: number | null
+}
+
+/**
+ * 解析 `ffprobe -of default=noprint_wrappers=1` 的 `key=value` 输出。
+ *
+ * 纯函数，便于单测：真实输出里可能出现 `N/A`、缺字段（mp3 没有 `bits_per_raw_sample`），
+ * 以及**封面图流**混入（必须靠 `-select_streams a:0` 排除，见 `probeAudioInfo`）。
+ */
+export function parseFfprobeAudioInfo(stdout: string): AudioProbeInfo {
+  const info: AudioProbeInfo = {
+    durationSec: null,
+    codec: null,
+    sampleRate: null,
+    bitsPerRawSample: null,
+    channels: null,
+  }
+  const num = (raw: string) => {
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  for (const line of stdout.split('\n')) {
+    const i = line.indexOf('=')
+    if (i <= 0) continue
+    const key = line.slice(0, i).trim()
+    const value = line.slice(i + 1).trim()
+    if (!value || value === 'N/A') continue
+    if (key === 'duration') info.durationSec = num(value)
+    else if (key === 'codec_name') info.codec = value
+    else if (key === 'sample_rate') info.sampleRate = num(value)
+    else if (key === 'bits_per_raw_sample') info.bitsPerRawSample = num(value)
+    else if (key === 'channels') info.channels = num(value)
+  }
+  return info
+}
+
+/**
+ * 一次 ffprobe 同时拿到时长与真实参数（位深 / 采样率 / 声道 / 容器）。
+ *
+ * **必须带 `-select_streams a:0`** —— 否则封面图（mjpeg）流会混进输出，
+ * 解析出来的位深会是图片的 8bit。
+ *
+ * 相比"只取 duration"的查法，实测耗时与内存完全一致（ffprobe 只读文件头、不解码音频），
+ * 所以要位深参数不必付出额外代价。
+ */
+export function probeAudioInfo(filePath: string): Promise<AudioProbeInfo | null> {
   if (!existsSync(filePath)) return Promise.resolve(null)
   return new Promise((resolve) => {
     const p = spawn(
       'ffprobe',
-      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filePath],
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'a:0',
+        '-show_entries',
+        'stream=codec_name,sample_rate,bits_per_raw_sample,channels',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1',
+        filePath,
+      ],
       { stdio: ['ignore', 'pipe', 'ignore'] },
     )
     let out = ''
@@ -89,10 +152,17 @@ export function probeAudioDurationSeconds(filePath: string): Promise<number | nu
     })
     p.on('error', () => resolve(null))
     p.on('close', () => {
-      const n = Number(String(out).trim())
-      resolve(Number.isFinite(n) && n > 0 ? n : null)
+      const info = parseFfprobeAudioInfo(out)
+      // 一个字段都没解析到 → 视为探测失败
+      resolve(info.durationSec == null && info.codec == null ? null : info)
     })
   })
+}
+
+/** 只要时长时的薄封装（复用同一次 probe，不额外 spawn） */
+export async function probeAudioDurationSeconds(filePath: string): Promise<number | null> {
+  const info = await probeAudioInfo(filePath)
+  return info?.durationSec ?? null
 }
 
 export function previewClipError(actualSec: number, expectedSec?: number | null): Error {
@@ -168,13 +238,16 @@ export async function probeCandidate(
   const ctrl = new AbortController()
   const onAbort = () => ctrl.abort()
   opts.signal?.addEventListener('abort', onAbort, { once: true })
+  // 传入的 signal 可能**在调用前就已 abort** —— 那种情况下 'abort' 事件不会再触发，
+  // 必须主动同步一次，否则探测会照常发起请求（契约要求此时返回 error）
+  if (opts.signal?.aborted) onAbort()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
     const res = await fetch(url, {
       signal: ctrl.signal,
       headers: { 'User-Agent': 'miyin/0.1', Referer: 'https://www.google.com/' },
     })
-    // 只读头：立刻取消 body，不下载内容
+    // 只读头：立刻取消 body，不下载内容（对照实验：服务端发头不发 body 时也不会挂，20ms 内返回）
     await res.body?.cancel().catch(() => {})
     if (!res.ok) {
       return { verdict: 'error', contentLength: null, estKbps: null, reason: `HTTP ${res.status}` }

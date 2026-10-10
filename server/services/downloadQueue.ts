@@ -38,11 +38,11 @@ import {
   minFullTrackBytes,
   previewClipError,
   previewSizeError,
-  probeAudioDurationSeconds,
+  probeAudioInfo,
   probeCandidate,
   type CandidateVerdict,
 } from '../utils/audioPreview'
-import { qualityFromBitrate } from '#shared/quality'
+import { correctedQualityFromProbe, qualityFromBitrate } from '#shared/quality'
 import { nextStatusAfterFailure, isRetryableError, isAllowedQuality } from './downloadState'
 import { msUntilCanStartTask } from '../utils/downloadIntervals'
 export type { TaskStatus } from './downloadState'
@@ -1522,6 +1522,28 @@ async function processTask(task: DownloadTaskRow) {
           .join(' > '),
     )
 
+    /**
+     * 按给定档位算落点。抽成闭包是因为 L3 可能在下载后修正档位 ——
+     * 那时要按真实档位重算一次，否则会出现「文件名里写 flac24bit、记录写 flac」的不一致。
+     */
+    const resolvePaths = (q: string, url: string) => {
+      const b = buildDownloadRelativeBase(
+        settings.nameTemplate,
+        {
+          artist: task.artist,
+          title: task.title,
+          album: task.album || undefined,
+          platform: task.platform,
+          quality: q,
+          id: task.external_id || undefined,
+          track: trackNo,
+        },
+        folderPrefix,
+      )
+      const e = guessExt(url, q)
+      return { base: b, ext: e, plannedPath: joinDownloadRelative(dir, b, e) }
+    }
+
     // ── 阶段 2：按序下载，首个通过全部校验者胜出 ──
     for (const cand of candidates) {
       if (abortController.signal.aborted) throw new Error('cancelled')
@@ -1532,24 +1554,12 @@ async function processTask(task: DownloadTaskRow) {
           : qualityFromBitrate(cand.estKbps)
       const key = `${cand.sourceId}@${cand.quality}`
 
-      base = buildDownloadRelativeBase(
-        settings.nameTemplate,
-        {
-          artist: task.artist,
-          title: task.title,
-          album: task.album || undefined,
-          platform: task.platform,
-          quality,
-          id: task.external_id || undefined,
-          track: trackNo,
-        },
-        folderPrefix,
-      )
-      const ext = guessExt(cand.url, quality)
+      const paths = resolvePaths(quality, cand.url)
+      base = paths.base
       // 计划落点：扩展名先按 URL / 音质猜，下载完成后再以魔数纠正
-      plannedPath = joinDownloadRelative(dir, base, ext)
+      plannedPath = paths.plannedPath
       filePath = plannedPath
-      temp = joinDownloadRelative(dir, `${base}${TEMP_SUFFIX}`, ext)
+      temp = joinDownloadRelative(dir, `${base}${TEMP_SUFFIX}`, paths.ext)
       tempPath = temp
       ensureParentDir(temp)
 
@@ -1589,8 +1599,9 @@ async function processTask(task: DownloadTaskRow) {
           throw err
         }
 
-        // 试听检测：有期望时长则对比；否则兜底识别常见固定试听时长（对临时文件探测，内容一致）
-        const actual = await probeAudioDurationSeconds(temp)
+        // 试听检测 + L3：一次 ffprobe 同时拿时长与真实参数（位深/采样率/声道），不额外 spawn
+        const info = await probeAudioInfo(temp)
+        const actual = info?.durationSec ?? null
         if (actual != null) {
           if (expectedDuration && expectedDuration > 0 && isLikelyPreviewClip(actual, expectedDuration)) {
             throw previewClipError(actual, expectedDuration)
@@ -1601,6 +1612,23 @@ async function processTask(task: DownloadTaskRow) {
           ) {
             throw previewClipError(actual, null)
           }
+        }
+
+        // L3：用实测位深修正**记录的档位**（不拒绝文件 —— 只剩 16bit 时硬拒会什么都下不到）
+        const corrected = correctedQualityFromProbe(quality, info) ?? quality
+        if (corrected !== quality) {
+          console.warn(
+            `[download] ${task.title}: 实测 ${info?.bitsPerRawSample ?? '?'}bit/` +
+              `${info?.sampleRate ?? '?'}Hz/${info?.channels ?? '?'}声道，` +
+              `配不上声称的 ${quality} → 记录档位修正为 ${corrected}`,
+          )
+          quality = corrected
+          // 落点里的 {quality} 也要跟着改，否则文件名与记录会互相矛盾
+          // （临时文件的名字不动 —— 提交时是 rename 到新 plannedPath，tempPath 只作来源）
+          const fixed = resolvePaths(quality, cand.url)
+          base = fixed.base
+          plannedPath = fixed.plannedPath
+          filePath = plannedPath
         }
       } catch (err: unknown) {
         const code = String((err as { code?: string })?.code)

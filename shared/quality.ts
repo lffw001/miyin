@@ -48,7 +48,8 @@ export function isQualityInverted(
  *
  * 判据：`体积 × 8 ÷ 时长` 估出的平均码率低于此值 ⇒ 内容配不上它声称的档位。
  * 实测锚点（《稻香》223s）：
- * - `ynx@flac24bit` 64578KB → **2372kbps**（真 Hi-Res，合格）
+ * - `ynx@flac24bit` 64578KB → **2372kbps**（合格；⚠️ ffprobe 实测为 **16bit/44.1kHz/6声道**，
+ *   高码率来自多声道而非位深 —— **码率判据区分不了位深**，要校验 24bit 需另用 ffprobe，见 L3）
  * - `念心音源@flac` 25403KB → **933kbps**（真无损，合格）
  * - `Hei Music@flac24bit` 8731KB → **321kbps**（谎报，实为 320k mp3 → implausible）
  *
@@ -108,4 +109,28 @@ export function qualityFromBitrate(estKbps: number): string {
   if (estKbps >= MIN_KBPS_BY_QUALITY['320k']!) return '320k'
   if (estKbps >= MIN_KBPS_BY_QUALITY['192k']!) return '192k'
   return '128k'
+}
+
+/**
+ * 用 ffprobe 实测参数修正「声称的档位」（L3）。
+ *
+ * ⚠️ **只修正记录的档位，不影响是否接受该文件** ——
+ * 位深不符时若硬拒绝，遇上"所有音源都只给 16bit"就会什么都下不到，
+ * 那比拿到一个 16bit 真无损更糟。
+ *
+ * 目前**只处理一种有确定证据的情况**：声称 `flac24bit` 但实测位深 < 24。
+ * 依据：`ynx` 声称 `flac24bit`，ffprobe 实测是 **16bit/44.1kHz/6声道** ——
+ * 高码率（2.2Mbps）来自**多声道**而非位深，码率判据区分不了，只能靠 ffprobe。
+ *
+ * 其余情况一律原样返回，不做超出证据的推断（例如 m4a 可能是 ALAC，不能当有损处理）。
+ */
+export function correctedQualityFromProbe(
+  claimed: string | null | undefined,
+  info: { bitsPerRawSample: number | null } | null | undefined,
+): string | null | undefined {
+  if (!claimed || !info) return claimed
+  if (claimed === 'flac24bit' && info.bitsPerRawSample != null && info.bitsPerRawSample < 24) {
+    return 'flac'
+  }
+  return claimed
 }

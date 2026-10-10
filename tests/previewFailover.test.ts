@@ -23,11 +23,13 @@ if (!globalThis.createError) {
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { mkdtempSync, readdirSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { closeDb, getDb } from '../server/utils/db'
 import { buildDedupKey, buildSearchText } from '#shared/trackKey'
+import { probeAudioInfo } from '../server/utils/audioPreview'
+import { saveSettings } from '../server/services/settingsService'
 
 /** 受控候选池：模拟取链层能拿到的「音源@档位 → URL」 */
 const upstream = vi.hoisted(() => ({
@@ -84,10 +86,10 @@ vi.mock('../server/services/metadataService', () => ({
   writeAudioMetadata: vi.fn(async () => ({ ok: true })),
 }))
 
-// 时长探测依赖 ffprobe；假音频没有真实时长 → 只覆盖探测函数本身
+// 时长/位深探测依赖 ffprobe；假音频没有真实参数 → 连探测函数一起覆盖（保持测试封闭）
 vi.mock('../server/utils/audioPreview', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../server/utils/audioPreview')>()
-  return { ...actual, probeAudioDurationSeconds: vi.fn(async () => null) }
+  return { ...actual, probeAudioInfo: vi.fn(async () => null) }
 })
 
 import { getTask, retryTask, tickWorker } from '../server/services/downloadQueue'
@@ -131,6 +133,9 @@ describe('候选择优：落到实测质量最好的音源', () => {
     process.env.DOWNLOAD_DIR = downloadDir
     upstream.pool = []
     upstream.calls = []
+    // 默认探测失败（假音频没有真实参数）；需要位深的用例自行 mockResolvedValueOnce
+    vi.mocked(probeAudioInfo).mockReset()
+    vi.mocked(probeAudioInfo).mockResolvedValue(null)
 
     const db = getDb()
     const insertSource = db.prepare(
@@ -147,9 +152,11 @@ describe('候选择优：落到实测质量最好的音源', () => {
         ? TRIAL_BYTES
         : isFakeMp3
           ? FAKE_HIRES_BYTES
-          : path.includes('low')
-            ? LOW_BYTES
-            : FULL_BYTES
+          : path.includes('hires-flac')
+            ? FAKE_HIRES_BYTES
+            : path.includes('low')
+              ? LOW_BYTES
+              : FULL_BYTES
       const body = Buffer.alloc(size, 0x41)
       // 魔数决定 L2 嗅探结果：mp3 用 ID3，其余用 fLaC
       if (isFakeMp3) body.write('ID3', 0, 'ascii')
@@ -305,5 +312,56 @@ describe('候选择优：落到实测质量最好的音源', () => {
     expect(task.file_size).toBe(FULL_BYTES)
     expect(upstream.calls.length).toBe(1)
     expect(upstream.calls[0]!.exclude).toEqual([])
+  })
+
+  it('L3：实测位深不足 24bit → 修正档位，且文件名里的 {quality} 同步改掉', async () => {
+    // 命名模板带 {quality}，才能验证"文件名与记录一致"
+    saveSettings({ nameTemplate: '{artist} - {title} [{quality}]' })
+    // 12MB/60s ≈ 1677kbps → 对 flac24bit 判为 ok，于是 quality 会保持声称值进入 L3
+    // 内容用 fLaC 魔数（不是 mp3），避免被 L2 先拦下
+    vi.mocked(probeAudioInfo).mockResolvedValueOnce({
+      durationSec: null,
+      codec: 'flac',
+      sampleRate: 44100,
+      bitsPerRawSample: 16,
+      channels: 6,
+    })
+    upstream.pool = [{ sourceId: 'src-a', quality: 'flac24bit', url: `${baseUrl}/hires-flac.flac` }]
+
+    const id = seedQueuedTask()
+    void tickWorker()
+    const done = await waitUntil(10000, () => getTask(id)?.status === 'completed')
+    expect(done).toBe(true)
+
+    const task = getTask(id)!
+    // 记录档位被修正
+    expect(task.quality).toBe('flac')
+    // 文件名同步一致，不再自相矛盾
+    expect(task.file_path).toContain('[flac]')
+    expect(task.file_path).not.toContain('flac24bit')
+    expect(existsSync(task.file_path!)).toBe(true)
+    // 文件字节数不变 —— 只改标签，不重下
+    expect(task.file_size).toBe(FAKE_HIRES_BYTES)
+  })
+
+  it('L3：实测确实是 24bit → 档位与文件名都保持 flac24bit（不该被误降）', async () => {
+    saveSettings({ nameTemplate: '{artist} - {title} [{quality}]' })
+    vi.mocked(probeAudioInfo).mockResolvedValueOnce({
+      durationSec: null,
+      codec: 'flac',
+      sampleRate: 96000,
+      bitsPerRawSample: 24,
+      channels: 2,
+    })
+    upstream.pool = [{ sourceId: 'src-a', quality: 'flac24bit', url: `${baseUrl}/hires-flac.flac` }]
+
+    const id = seedQueuedTask()
+    void tickWorker()
+    const done = await waitUntil(10000, () => getTask(id)?.status === 'completed')
+    expect(done).toBe(true)
+
+    const task = getTask(id)!
+    expect(task.quality).toBe('flac24bit')
+    expect(task.file_path).toContain('[flac24bit]')
   })
 })
