@@ -2,9 +2,17 @@ import { platformLabel } from '#shared/platforms'
 import { SEARCH_PAGE_SIZE } from '#shared/searchPagination'
 import {
   cleanArtist,
+  kgErrorDetector,
+  kwErrorDetector,
   parseLooseJson,
   type SearchTrack,
 } from './platformSearch'
+import {
+  runChannelMatrix,
+  summarizeAttempts,
+  UpstreamMatrixError,
+  type UpstreamChannel,
+} from './upstreamChannels'
 
 export type SearchAlbum = {
   id: string
@@ -204,11 +212,40 @@ export function mapWyAlbumDetail(data: any): AlbumDetail {
   return { album, tracks }
 }
 
+/**
+ * 网易云专辑搜索通道矩阵。
+ * 实测两端点 `type=10` 返回**完全相同**的 album 字段集（含 `picUrl`），故结果等价，
+ * 可共用 `mapWySearchAlbums`。备用端点仅在主通道失败时触发。
+ */
+function wyAlbumChannels(): UpstreamChannel<SearchAlbum>[] {
+  const detect = (d: any) => (d?.code !== undefined && d.code !== 200 ? `code ${d.code}` : null)
+  const make = (
+    id: string,
+    label: string,
+    path: string,
+    priority: number,
+  ): UpstreamChannel<SearchAlbum> => ({
+    id,
+    label,
+    platform: 'wy',
+    priority,
+    buildUrl: (c) => {
+      const offset = (c.page - 1) * SEARCH_PAGE_SIZE
+      return `https://music.163.com${path}?s=${encodeURIComponent(c.keyword)}&type=10&limit=${SEARCH_PAGE_SIZE}&offset=${offset}`
+    },
+    headers: { Referer: 'https://music.163.com/' },
+    detectUpstreamError: detect,
+    parse: (d: any) => mapWySearchAlbums(d?.result?.albums || []),
+  })
+  return [
+    make('wy:cloudsearch-album', '网易云专辑 cloudsearch', '/api/cloudsearch/pc', 1),
+    make('wy:search-album-web', '网易云专辑 search/get/web（备用）', '/api/search/get/web', 2),
+  ]
+}
+
 async function searchWyAlbums(keyword: string, page: number): Promise<SearchAlbum[]> {
-  const offset = (page - 1) * SEARCH_PAGE_SIZE
-  const url = `https://music.163.com/api/cloudsearch/pc?s=${encodeURIComponent(keyword)}&type=10&limit=${SEARCH_PAGE_SIZE}&offset=${offset}`
-  const data = await fetchJson(url, { headers: { Referer: 'https://music.163.com/' } })
-  return mapWySearchAlbums(data?.result?.albums || [])
+  const outcome = await runChannelMatrix(wyAlbumChannels(), { keyword, page }, { scope: 'albumSearch' })
+  return outcome.items
 }
 
 async function getWyAlbumDetail(albumId: string): Promise<AlbumDetail> {
@@ -249,6 +286,18 @@ export function mapTxSearchAlbums(raw: any[]): SearchAlbum[] {
   })
 }
 
+/**
+ * 由 QQ 专辑详情条目的 `size*` 字段反推真实可得档位。
+ * 详情接口自带 `size128` / `size320` / `sizeflac` / `sizeape`，无需额外请求。
+ */
+function txQualitysFromAlbumSong(s: any): string[] {
+  const out: string[] = []
+  if (Number(s?.size128) > 0) out.push('128k')
+  if (Number(s?.size320) > 0) out.push('320k')
+  if (Number(s?.sizeflac) > 0 || Number(s?.sizeape) > 0) out.push('flac')
+  return out.length ? out : ['128k', '320k']
+}
+
 /** tx 专辑详情曲目映射（含完整 musicInfo） */
 export function mapTxAlbumSong(s: any, albumTitle = '', albummid = ''): SearchTrack {
   const mid = String(s.songmid || s.mid || '')
@@ -262,7 +311,7 @@ export function mapTxAlbumSong(s: any, albumTitle = '', albummid = ''): SearchTr
     duration: Number(s.interval || 0),
     platform: 'tx',
     cover,
-    qualitys: ['128k', '320k'],
+    qualitys: txQualitysFromAlbumSong(s),
     musicInfo: {
       name: s.songname || s.name,
       singer: artistsJoin(s.singer),
@@ -303,13 +352,52 @@ export function mapTxAlbumDetail(data: any, albumId: string): AlbumDetail {
   return { album, tracks }
 }
 
+/**
+ * QQ 专辑搜索通道矩阵。
+ * 实测两端点 `t=8` 结果完全一致（同样 21 条、albumMID 相同），
+ * 但新端点快约 7 倍（~0.4s vs ~3.1s），故新端点为主、老端点兜底。
+ * 代价：新端点不返回 `song_count` / `albumPic` / `singer_list`。
+ * `albumMID` 仍在，封面可由 albumMID 拼接得到，仅曲目数退化为「未知」。
+ */
+function txAlbumChannels(): UpstreamChannel<SearchAlbum>[] {
+  const make = (
+    id: string,
+    label: string,
+    origin: string,
+    priority: number,
+    timeoutMs?: number,
+  ): UpstreamChannel<SearchAlbum> => ({
+    id,
+    label,
+    platform: 'tx',
+    priority,
+    timeoutMs,
+    buildUrl: (c) =>
+      `${origin}?w=${encodeURIComponent(c.keyword)}&p=${c.page}&n=${SEARCH_PAGE_SIZE}&format=json&t=8`,
+    headers: QQ_HEADERS,
+    detectUpstreamError: (d: any) => (d?.code !== undefined && d.code !== 0 ? `code ${d.code}` : null),
+    parse: (d: any) => mapTxSearchAlbums(d?.data?.album?.list || []),
+  })
+  return [
+    make(
+      'tx:soso-album-v2',
+      'QQ专辑搜索 search_for_qq_cp',
+      'https://c.y.qq.com/soso/fcgi-bin/search_for_qq_cp',
+      1,
+    ),
+    make(
+      'tx:soso-album-cp',
+      'QQ专辑搜索 client_search_cp',
+      'https://c.y.qq.com/soso/fcgi-bin/client_search_cp',
+      2,
+      15_000,
+    ),
+  ]
+}
+
 async function searchTxAlbums(keyword: string, page: number): Promise<SearchAlbum[]> {
-  // 带 new_json/aggr 等参数时 album.list 常为空；精简参数与单曲搜索一致更稳
-  const url =
-    `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?` +
-    `w=${encodeURIComponent(keyword)}&p=${page}&n=${SEARCH_PAGE_SIZE}&format=json&t=8`
-  const data = await fetchJson(url, { headers: QQ_HEADERS })
-  return mapTxSearchAlbums(data?.data?.album?.list || [])
+  const outcome = await runChannelMatrix(txAlbumChannels(), { keyword, page }, { scope: 'albumSearch' })
+  return outcome.items
 }
 
 async function getTxAlbumDetail(albumId: string): Promise<AlbumDetail> {
@@ -318,6 +406,11 @@ async function getTxAlbumDetail(albumId: string): Promise<AlbumDetail> {
     `https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg?` +
     `albummid=${encodeURIComponent(albumId)}&format=json&inCharset=utf-8&outCharset=utf-8&notice=0&platform=yqq&needNewCode=0`
   const data = await fetchJson(url, { headers: QQ_HEADERS })
+  // 实测成功码为 0；非法 albummid 返回 HTTP 200 + code 1101 "para error!"（不能当空专辑吞掉）
+  if (data?.code !== undefined && data.code !== 0) {
+    const sub = data.subcode && data.subcode !== data.code ? ` subcode ${data.subcode}` : ''
+    throw new Error(`${data.message || 'upstream error'} (code ${data.code}${sub})`)
+  }
   const detail = mapTxAlbumDetail(data, albumId)
   if (!detail.tracks.length) throw new Error('专辑曲目为空')
   return detail
@@ -388,10 +481,29 @@ export function mapKwAlbumDetail(data: any, albumId: string): AlbumDetail {
   return { album, tracks }
 }
 
+/**
+ * 酷我专辑搜索通道矩阵。
+ * ⚠️ 酷我暂无可用备用专辑端点（与歌曲搜索同源限制：新 web 接口需 token、
+ *    旧 mobi 接口 404）→ 保持单通道，靠 `kwErrorDetector` 保证失败不静默。
+ */
+function kwAlbumChannels(): UpstreamChannel<SearchAlbum>[] {
+  return [
+    {
+      id: 'kw:r.s-album',
+      label: '酷我专辑 r.s',
+      platform: 'kw',
+      priority: 1,
+      buildUrl: (c) =>
+        `https://search.kuwo.cn/r.s?all=${encodeURIComponent(c.keyword)}&ft=album&client=kt&pn=${c.page - 1}&rn=${SEARCH_PAGE_SIZE}&rformat=json&encoding=utf8`,
+      detectUpstreamError: kwErrorDetector,
+      parse: (d: any) => mapKwSearchAlbums(d?.abslist || d?.albumlist || []),
+    },
+  ]
+}
+
 async function searchKwAlbums(keyword: string, page: number): Promise<SearchAlbum[]> {
-  const url = `https://search.kuwo.cn/r.s?all=${encodeURIComponent(keyword)}&ft=album&client=kt&pn=${page - 1}&rn=${SEARCH_PAGE_SIZE}&rformat=json&encoding=utf8`
-  const data = await fetchJson(url)
-  return mapKwSearchAlbums(data?.abslist || data?.albumlist || [])
+  const outcome = await runChannelMatrix(kwAlbumChannels(), { keyword, page }, { scope: 'albumSearch' })
+  return outcome.items
 }
 
 async function getKwAlbumDetail(albumId: string): Promise<AlbumDetail> {
@@ -406,6 +518,9 @@ async function getKwAlbumDetail(albumId: string): Promise<AlbumDetail> {
       `https://search.kuwo.cn/r.s?stype=albuminfo&albumid=${encodeURIComponent(albumId)}` +
       `&pn=${page}&rn=${ALBUM_SONG_PAGE_SIZE}&encoding=utf8&rformat=json`
     const data = await fetchJson(url)
+    // 防御性业务态检查：避免「HTTP 200 + 业务失败」被当成"空专辑"静默吞掉
+    const bizErr = kwErrorDetector(data)
+    if (bizErr) throw new Error(bizErr)
     if (page === 0) {
       firstData = data
       albumRaw = (data?.album || data?.data?.album || {}) as Record<string, unknown>
@@ -536,16 +651,39 @@ export function mapKgAlbumDetail(
   return { album, tracks }
 }
 
+/**
+ * 酷狗专辑搜索通道矩阵。
+ * 主通道改为 `mobileservice`（HTTPS 可用，实测 ~0.27s），
+ * 备通道为原有 `mobilecdn`（仅 HTTP 可握手，且慢约 10 倍）。
+ * `complexsearch /v2/search/album` 已 404，不再作为候选。
+ */
+function kgAlbumChannels(): UpstreamChannel<SearchAlbum>[] {
+  const make = (
+    id: string,
+    label: string,
+    origin: string,
+    priority: number,
+    extraQs: string,
+  ): UpstreamChannel<SearchAlbum> => ({
+    id,
+    label,
+    platform: 'kg',
+    priority,
+    buildUrl: (c) =>
+      `${origin}/api/v3/search/album?keyword=${encodeURIComponent(c.keyword)}&page=${c.page}&pagesize=${SEARCH_PAGE_SIZE}&iscorrect=1${extraQs}`,
+    headers: { Referer: 'https://www.kugou.com/' },
+    detectUpstreamError: kgErrorDetector([1]),
+    parse: (d: any) => mapKgSearchAlbums(d?.data?.info || d?.data?.lists || []),
+  })
+  return [
+    make('kg:mobileservice-album-v3', '酷狗专辑搜索 mobileservice v3', 'https://mobileservice.kugou.com', 1, ''),
+    make('kg:mobilecdn-album-v3', '酷狗专辑搜索 mobilecdn v3', 'http://mobilecdn.kugou.com', 2, '&version=9108'),
+  ]
+}
+
 async function searchKgAlbums(keyword: string, page: number): Promise<SearchAlbum[]> {
-  // complexsearch /v2/search/album 已 404；mobilecdn v3 无需签名
-  const url =
-    `http://mobilecdn.kugou.com/api/v3/search/album?keyword=${encodeURIComponent(keyword)}` +
-    `&page=${page}&pagesize=${SEARCH_PAGE_SIZE}&iscorrect=1&version=9108`
-  const data = await fetchJson(url, { headers: { Referer: 'https://www.kugou.com/' } })
-  if (data?.status === 0 || data?.errcode) {
-    throw new Error(data?.error_msg || data?.error || `errcode ${data?.errcode}`)
-  }
-  return mapKgSearchAlbums(data?.data?.info || data?.data?.lists || [])
+  const outcome = await runChannelMatrix(kgAlbumChannels(), { keyword, page }, { scope: 'albumSearch' })
+  return outcome.items
 }
 
 function kgAlbumSongList(payload: any): any[] {
@@ -644,12 +782,21 @@ export async function searchAlbums(platform: string, keyword: string, page = 1) 
     albumSearchCache.set(key, { at: Date.now(), items })
     return items
   } catch (err: any) {
+    if (err instanceof UpstreamMatrixError) {
+      const detail = summarizeAttempts(err.attempts)
+      throw createError({
+        statusCode: 502,
+        statusMessage: 'Bad Gateway',
+        message: `专辑搜索失败(${platformLabel(platform)}): 全部上游通道不可用 · ${detail}`,
+        data: { platform, scope: 'albumSearch', reason: detail, attempts: err.attempts },
+      })
+    }
     const detail = String(err?.message || err || 'unknown')
     throw createError({
       statusCode: 502,
       statusMessage: 'Bad Gateway',
       message: `专辑搜索失败(${platformLabel(platform)}): ${detail}`,
-      data: { platform, reason: detail },
+      data: { platform, scope: 'albumSearch', reason: detail },
     })
   }
 }
